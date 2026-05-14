@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { documents, issueDocuments, issues } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import { documentService } from "./documents.js";
+import { redactSensitiveText } from "../redaction.js";
 
 export { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY };
 export const ISSUE_CONTINUATION_SUMMARY_TITLE = "Continuation Summary";
@@ -62,13 +63,13 @@ function asNonEmptyString(value: unknown) {
 
 function readResultSummary(resultJson: Record<string, unknown> | null | undefined) {
   if (!resultJson || typeof resultJson !== "object" || Array.isArray(resultJson)) return null;
-  return (
+  const value =
     asNonEmptyString(resultJson.summary) ??
     asNonEmptyString(resultJson.result) ??
     asNonEmptyString(resultJson.message) ??
     asNonEmptyString(resultJson.error) ??
-    null
-  );
+    null;
+  return value ? redactSensitiveText(value) : null;
 }
 
 function extractMarkdownSection(markdown: string | null | undefined, heading: string) {
@@ -152,7 +153,7 @@ export function buildContinuationSummaryMarkdown(input: {
     recentActions.push(`Latest run error${run.errorCode ? ` (${run.errorCode})` : ""}: ${truncateText(run.error, 500)}`);
   }
 
-  const paths = extractPathCandidates(resultSummary, run.stdoutExcerpt, run.stderrExcerpt, input.previousSummaryBody);
+  const paths = extractPathCandidates(resultSummary, input.previousSummaryBody);
   const objective = extractMarkdownSection(issue.description, "Objective") ?? issue.description?.trim() ?? "No objective captured.";
   const acceptanceCriteria = extractMarkdownSection(issue.description, "Acceptance Criteria") ?? "No explicit acceptance criteria captured.";
   const mode = inferMode(issue, run);
