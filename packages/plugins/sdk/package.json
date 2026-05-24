@@ -52,7 +52,7 @@
     }
   },
   "bin": {
-    "paperclip-plugin-dev-server": "./dist/dev-cli.js"
+    "paperclip-plugin-dev-server": "./bin/dev-server.js"
   },
   "publishConfig": {
     "access": "public",
@@ -98,6 +98,7 @@
     "types": "./dist/index.d.ts"
   },
   "files": [
+    "bin",
     "dist"
   ],
   "scripts": {
