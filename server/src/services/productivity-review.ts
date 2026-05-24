@@ -211,6 +211,12 @@ function isExplicitLongLivedChatMirrorIssue(issue: Pick<IssueRow, "title" | "des
   );
 }
 
+function isPinnedChatMirrorIssue(issue: Pick<IssueRow, "title" | "description">) {
+  const title = issue.title.trim().toLowerCase();
+  const description = issue.description?.toLowerCase() ?? "";
+  return title.startsWith("[pin open]") && (title.includes("chat mirror") || description.includes("chat mirror"));
+}
+
 export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: EnqueueWakeup }) {
   const issuesSvc = issueService(db);
   const budgets = budgetService(db);
@@ -812,6 +818,10 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const prefixCache = new Map<string, string>();
     for (const candidate of candidates) {
       if (!candidate.assigneeAgentId) {
+        result.skipped += 1;
+        continue;
+      }
+      if (isPinnedChatMirrorIssue(candidate)) {
         result.skipped += 1;
         continue;
       }

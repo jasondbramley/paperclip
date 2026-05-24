@@ -100,7 +100,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       id: issueId,
       companyId,
       title: opts?.title ?? "Implement data import",
-      description: opts?.description,
+      description: opts?.description ?? null,
       status: opts?.status ?? "in_progress",
       priority: "medium",
       assigneeAgentId: coderId,
@@ -406,6 +406,30 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(1);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+  });
+
+  it("skips pinned chat mirror issues while preserving normal long-active reviews", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const pinned = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      title: "[PIN OPEN] CEO-Jason chat mirror target - Coding Agent",
+      description: "Deliberately pinned chat mirror ticket that stays open by design.",
+    });
+    const normal = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const service = productivityReviewService(db);
+
+    const pinnedResult = await service.reconcileProductivityReviews({ now, companyId: pinned.companyId });
+    const normalResult = await service.reconcileProductivityReviews({ now, companyId: normal.companyId });
+
+    expect(pinnedResult.created).toBe(0);
+    expect(pinnedResult.skipped).toBe(1);
+    expect(await listProductivityReviews(pinned.companyId)).toHaveLength(0);
+    expect(normalResult.created).toBe(1);
+    expect(await listProductivityReviews(normal.companyId)).toHaveLength(1);
   });
 
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {
