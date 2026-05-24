@@ -843,6 +843,7 @@ export function issueRoutes(
     searchService?: CompanySearchService;
     searchRateLimiter?: CompanySearchRateLimiter;
     pluginWorkerManager?: PluginWorkerManager;
+    heartbeatWakeup?: ReturnType<typeof heartbeatService>["wakeup"];
   } = {},
 ) {
   const router = Router();
@@ -851,6 +852,7 @@ export function issueRoutes(
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
+  const heartbeatWakeup = opts.heartbeatWakeup ?? heartbeat.wakeup;
   const feedback = feedbackService(db);
   const companiesSvc = companyService(db);
   let searchSvc = opts.searchService ?? null;
@@ -2370,7 +2372,7 @@ export function issueRoutes(
       existing.status !== result.issue.status &&
       result.issue.assigneeAgentId
     ) {
-      void heartbeat.wakeup(result.issue.assigneeAgentId, {
+      void heartbeatWakeup(result.issue.assigneeAgentId, {
         source: "automation",
         triggerDetail: "system",
         reason: "issue_recovery_action_restored",
