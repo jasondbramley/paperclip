@@ -86,6 +86,47 @@ describe("issue continuation summaries", () => {
     expect(body).toContain("Inspect the failed run, fix the cause");
   });
 
+  it("does not carry a stale failed-run next action into a later successful run", () => {
+    const previousSummaryBody = [
+      "# Continuation Summary",
+      "",
+      "## Next Action",
+      "",
+      "- Inspect the failed run, fix the cause, and resume from the most recent concrete action above.",
+    ].join("\n");
+
+    const body = buildContinuationSummaryMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-2602",
+        title: "Pinned chat anchor",
+        description: "Pin OPEN - this is a live channel, never close.",
+        status: "in_progress",
+        priority: "medium",
+      },
+      run: {
+        id: "run-3",
+        status: "succeeded",
+        error: null,
+        resultJson: {
+          summary: "No new action is required this wake. Final disposition: `in_progress`.",
+        },
+        finishedAt: new Date("2026-05-24T18:37:03.758Z"),
+      },
+      agent: {
+        id: "agent-1",
+        name: "CodexCoder",
+        adapterType: "codex_local",
+      },
+      previousSummaryBody,
+    });
+
+    expect(extractContinuationSummaryNextAction(body)).toBe(
+      "Resume implementation from the acceptance criteria, latest comments, and this summary.",
+    );
+    expect(body).not.toContain("## Next Action\n\n- Inspect the failed run");
+  });
+
   it("detects continuation summaries that explicitly park executor work for review", () => {
     const body = [
       "# Continuation Summary",

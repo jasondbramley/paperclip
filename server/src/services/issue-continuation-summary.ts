@@ -11,6 +11,9 @@ const SUMMARY_SECTION_MAX_CHARS = 1_200;
 const PATH_CANDIDATE_RE = /(?:^|[\s`"'(])((?:server|ui|packages|doc|scripts|\.github)\/[A-Za-z0-9._/-]+)/g;
 const WAITING_FOR_REVIEW_OR_APPROVAL_RE =
   /\bwait(?:ing)? for\b.{0,160}\b(?:review(?:er)?(?: feedback)?|approval|board|human|user|operator)\b/i;
+const FAILED_RUN_NEXT_ACTION =
+  "Inspect the failed run, fix the cause, and resume from the most recent concrete action above.";
+const DEFAULT_NEXT_ACTION = "Resume implementation from the acceptance criteria, latest comments, and this summary.";
 
 type IssueSummaryInput = {
   id: string;
@@ -103,10 +106,11 @@ function inferNextAction(issue: IssueSummaryInput, run: RunSummaryInput, previou
   if (issue.status === "done") return "Review the completed issue output and close any remaining follow-up comments.";
   if (issue.status === "in_review") return "Wait for reviewer feedback or approval before continuing executor work.";
   if (run.status === "failed" || run.status === "timed_out") {
-    return "Inspect the failed run, fix the cause, and resume from the most recent concrete action above.";
+    return FAILED_RUN_NEXT_ACTION;
   }
   if (run.status === "cancelled") return "Confirm the cancellation reason before starting another run.";
-  return previousNextAction ?? "Resume implementation from the acceptance criteria, latest comments, and this summary.";
+  if (previousNextAction === FAILED_RUN_NEXT_ACTION) return DEFAULT_NEXT_ACTION;
+  return previousNextAction ?? DEFAULT_NEXT_ACTION;
 }
 
 function bulletList(items: string[], empty: string) {
