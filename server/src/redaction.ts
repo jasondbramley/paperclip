@@ -3,14 +3,13 @@ import { redactCommandText } from "@paperclipai/adapter-utils";
 const SECRET_KEY_PATTERN = [
   String.raw`api[-_]?key`,
   String.raw`access[-_]?token`,
-  String.raw`(?:^|[-_])token(?:$|[-_])`,
   String.raw`auth(?:_?token)?`,
+  String.raw`token`,
   String.raw`authorization`,
   String.raw`bearer`,
   String.raw`secret`,
   String.raw`passwd`,
   String.raw`password`,
-  String.raw`pwd`,
   String.raw`credential`,
   String.raw`jwt`,
   String.raw`private[-_]?key`,
@@ -20,7 +19,8 @@ const SECRET_KEY_PATTERN = [
   String.raw`openbrain[-_A-Za-z0-9]*(?:url|uri|dsn|secret|token|key|password|passwd|pwd)`,
 ].join("|");
 
-const SECRET_PAYLOAD_KEY_RE = new RegExp(`(?:${SECRET_KEY_PATTERN})`, "i");
+const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*(?:${SECRET_KEY_PATTERN})[A-Za-z0-9_-]*`;
+const SECRET_PAYLOAD_KEY_RE = new RegExp(SECRET_FIELD_NAME_PATTERN, "i");
 const COMMAND_PAYLOAD_KEY_RE =
   /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
@@ -47,6 +47,12 @@ const SECRET_TEXT_HINTS = [
   "private",
   "cookie",
   "connectionstring",
+  "connection",
+  "database",
+  "db_",
+  "postgres",
+  "pg",
+  "openbrain",
   "sk-",
   "ghp_",
   "gho_",
