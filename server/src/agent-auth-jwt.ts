@@ -18,6 +18,7 @@ export interface LocalAgentJwtClaims {
 }
 
 const JWT_ALGORITHM = "HS256";
+export const DEFAULT_LOCAL_AGENT_JWT_TTL_SECONDS = 60 * 60 * 6;
 
 function parseNumber(value: string | undefined, fallback: number) {
   const parsed = Number(value);
@@ -31,7 +32,7 @@ function jwtConfig() {
 
   return {
     secret,
-    ttlSeconds: parseNumber(process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS, 60 * 60 * 48),
+    ttlSeconds: parseNumber(process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS, DEFAULT_LOCAL_AGENT_JWT_TTL_SECONDS),
     issuer: process.env.PAPERCLIP_AGENT_JWT_ISSUER ?? "paperclip",
     audience: process.env.PAPERCLIP_AGENT_JWT_AUDIENCE ?? "paperclip-api",
   };
