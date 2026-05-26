@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createLocalAgentJwt, verifyLocalAgentJwt } from "../agent-auth-jwt.js";
+import {
+  createLocalAgentJwt,
+  DEFAULT_LOCAL_AGENT_JWT_TTL_SECONDS,
+  verifyLocalAgentJwt,
+} from "../agent-auth-jwt.js";
 
 describe("agent local JWT", () => {
   const secretEnv = "PAPERCLIP_AGENT_JWT_SECRET";
@@ -53,6 +57,16 @@ describe("agent local JWT", () => {
       iss: "paperclip",
       aud: "paperclip-api",
     });
+  });
+
+  it("defaults local agent tokens to six hours", () => {
+    delete process.env[ttlEnv];
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const token = createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1");
+
+    const claims = verifyLocalAgentJwt(token!);
+
+    expect(claims?.exp).toBe(claims!.iat + DEFAULT_LOCAL_AGENT_JWT_TTL_SECONDS);
   });
 
   it("returns null when secret is missing", () => {

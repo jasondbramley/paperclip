@@ -114,6 +114,15 @@ describe("redaction", () => {
     });
   });
 
+  it("redacts quoted secret assignments from unstructured text", () => {
+    const input = "export PAPERCLIP_API_KEY='placeholder-paperclip-key'";
+
+    const result = redactSensitiveText(input);
+
+    expect(result).toBe(`export PAPERCLIP_API_KEY='${REDACTED_EVENT_VALUE}'`);
+    expect(result).not.toContain("placeholder-paperclip-key");
+  });
+
   it("redacts non-string command args after secret flags", () => {
     const result = redactEventPayload({
       commandArgs: ["--api-key", { nested: "secret-value" }, "safe-next"],

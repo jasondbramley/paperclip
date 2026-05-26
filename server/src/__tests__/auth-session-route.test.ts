@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { actorMiddleware } from "../middleware/auth.js";
 
 function createSelectChain(rows: unknown[]) {
@@ -24,12 +25,51 @@ function createDb() {
   } as any;
 }
 
+function createJwtDb(runStatus: string | null) {
+  return {
+    select: vi
+      .fn()
+      .mockImplementationOnce(() => createSelectChain([]))
+      .mockImplementationOnce(() => createSelectChain([]))
+      .mockImplementationOnce(() =>
+        createSelectChain([{
+          id: "agent-1",
+          companyId: "company-1",
+          status: "active",
+        }]),
+      )
+      .mockImplementationOnce(() =>
+        createSelectChain(runStatus ? [{ id: "run-1", status: runStatus }] : []),
+      ),
+  } as any;
+}
+
+function addJsonErrorHandler(app: express.Express) {
+  app.use(
+    (
+      err: { status?: number; message?: string },
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction,
+    ) => {
+      res.status(err.status ?? 500).json({ error: err.message ?? "Internal server error" });
+    },
+  );
+}
+
 describe("actorMiddleware authenticated session profile", () => {
   const originalCloudTenantToken = process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
+  const originalJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+  const originalJwtTtl = process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS;
 
   afterEach(() => {
     if (originalCloudTenantToken === undefined) delete process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN;
     else process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = originalCloudTenantToken;
+    if (originalJwtSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalJwtSecret;
+    if (originalJwtTtl === undefined) delete process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS;
+    else process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS = originalJwtTtl;
+    vi.useRealTimers();
   });
 
   it("preserves the signed-in user name and email on the board actor", async () => {
@@ -64,6 +104,138 @@ describe("actorMiddleware authenticated session profile", () => {
       memberships: [],
       isInstanceAdmin: false,
     });
+  });
+
+  it("rejects invalid bearer tokens instead of falling back to local trusted board access", async () => {
+    const app = express();
+    app.use(
+      actorMiddleware(createDb(), {
+        deploymentMode: "local_trusted",
+      }),
+    );
+    app.patch("/api/issues/:id", (req, res) => {
+      res.json(req.actor);
+    });
+    addJsonErrorHandler(app);
+
+    const res = await request(app)
+      .patch("/api/issues/issue-1")
+      .set("Authorization", "Bearer definitely-not-valid")
+      .send({ status: "done" });
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: "Invalid bearer token" });
+  });
+
+  it("keeps local trusted implicit board access when no bearer token is sent", async () => {
+    const app = express();
+    app.use(
+      actorMiddleware(createDb(), {
+        deploymentMode: "local_trusted",
+      }),
+    );
+    app.patch("/api/issues/:id", (req, res) => {
+      res.json(req.actor);
+    });
+
+    const res = await request(app).patch("/api/issues/issue-1").send({ status: "done" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      type: "board",
+      userId: "local-board",
+      source: "local_implicit",
+    });
+  });
+
+  it("accepts local agent JWTs only while the originating run is active", async () => {
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "test-secret";
+    process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS = "3600";
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const token = createLocalAgentJwt("agent-1", "company-1", "codex_local", "run-1");
+
+    const app = express();
+    app.use(
+      actorMiddleware(createJwtDb("running"), {
+        deploymentMode: "authenticated",
+        resolveSession: async () => null,
+      }),
+    );
+    app.get("/actor", (req, res) => {
+      res.json(req.actor);
+    });
+    addJsonErrorHandler(app);
+
+    const res = await request(app)
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`)
+      .set("X-Paperclip-Run-Id", "run-1");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      runId: "run-1",
+      source: "agent_jwt",
+    });
+  });
+
+  it("rejects local agent JWTs after the originating run has stopped", async () => {
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "test-secret";
+    process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS = "3600";
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const token = createLocalAgentJwt("agent-1", "company-1", "codex_local", "run-1");
+
+    const app = express();
+    app.use(
+      actorMiddleware(createJwtDb("cancelled"), {
+        deploymentMode: "authenticated",
+        resolveSession: async () => null,
+      }),
+    );
+    app.get("/actor", (req, res) => {
+      res.json(req.actor);
+    });
+    addJsonErrorHandler(app);
+
+    const res = await request(app)
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`)
+      .set("X-Paperclip-Run-Id", "run-1");
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: "Invalid bearer token" });
+  });
+
+  it("rejects local agent JWTs when the request run header does not match the signed run", async () => {
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "test-secret";
+    process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS = "3600";
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const token = createLocalAgentJwt("agent-1", "company-1", "codex_local", "run-1");
+
+    const app = express();
+    app.use(
+      actorMiddleware(createJwtDb("running"), {
+        deploymentMode: "authenticated",
+        resolveSession: async () => null,
+      }),
+    );
+    app.get("/actor", (req, res) => {
+      res.json(req.actor);
+    });
+    addJsonErrorHandler(app);
+
+    const res = await request(app)
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`)
+      .set("X-Paperclip-Run-Id", "different-run");
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: "Invalid bearer token" });
   });
 
   it("trusts Cloud tenant identity headers and seeds board access", async () => {

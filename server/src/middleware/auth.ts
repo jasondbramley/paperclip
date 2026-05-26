@@ -2,12 +2,13 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { Request, RequestHandler } from "express";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentApiKeys, agents, authUsers, companies, companyMemberships, instanceUserRoles } from "@paperclipai/db";
+import { agentApiKeys, agents, authUsers, companies, companyMemberships, heartbeatRuns, instanceUserRoles } from "@paperclipai/db";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { boardAuthService } from "../services/board-auth.js";
+import { unauthorized } from "../errors.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -102,7 +103,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     const token = authHeader.slice("bearer ".length).trim();
     if (!token) {
-      next();
+      next(unauthorized("Invalid bearer token"));
       return;
     }
 
@@ -138,7 +139,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     if (!key) {
       const claims = verifyLocalAgentJwt(token);
       if (!claims) {
-        next();
+        next(unauthorized("Invalid bearer token"));
         return;
       }
 
@@ -149,12 +150,34 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         .then((rows) => rows[0] ?? null);
 
       if (!agentRecord || agentRecord.companyId !== claims.company_id) {
-        next();
+        next(unauthorized("Invalid bearer token"));
         return;
       }
 
       if (agentRecord.status === "terminated" || agentRecord.status === "pending_approval") {
-        next();
+        next(unauthorized("Invalid bearer token"));
+        return;
+      }
+
+      if (runIdHeader && runIdHeader !== claims.run_id) {
+        next(unauthorized("Invalid bearer token"));
+        return;
+      }
+
+      const runRecord = await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.id, claims.run_id),
+            eq(heartbeatRuns.agentId, claims.sub),
+            eq(heartbeatRuns.companyId, claims.company_id),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+
+      if (!runRecord || !["queued", "running"].includes(runRecord.status)) {
+        next(unauthorized("Invalid bearer token"));
         return;
       }
 
@@ -163,7 +186,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         agentId: claims.sub,
         companyId: claims.company_id,
         keyId: undefined,
-        runId: runIdHeader || claims.run_id || undefined,
+        runId: claims.run_id,
         source: "agent_jwt",
       };
       next();
@@ -182,7 +205,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       .then((rows) => rows[0] ?? null);
 
     if (!agentRecord || agentRecord.status === "terminated" || agentRecord.status === "pending_approval") {
-      next();
+      next(unauthorized("Invalid bearer token"));
       return;
     }
 
