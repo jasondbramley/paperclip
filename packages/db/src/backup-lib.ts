@@ -42,6 +42,16 @@ export type RunDatabaseRestoreOptions = {
   connectTimeoutSeconds?: number;
 };
 
+export type PostgresCliConnectionEnv = NodeJS.ProcessEnv & {
+  PGHOST?: string;
+  PGPORT?: string;
+  PGDATABASE?: string;
+  PGUSER?: string;
+  PGPASSWORD?: string;
+  PGSSLMODE?: string;
+  PGCONNECT_TIMEOUT?: string;
+};
+
 type SequenceDefinition = {
   sequence_schema: string;
   sequence_name: string;
@@ -293,7 +303,6 @@ async function runPgDumpBackup(opts: {
   const child = spawn(
     pgDumpBin,
     [
-      `--dbname=${opts.connectionString}`,
       "--format=plain",
       "--clean",
       "--if-exists",
@@ -303,7 +312,7 @@ async function runPgDumpBackup(opts: {
     {
       stdio: ["ignore", "pipe", "pipe"],
       env: {
-        ...process.env,
+        ...createPostgresCliConnectionEnv(opts.connectionString, process.env),
         PGCONNECT_TIMEOUT: String(opts.connectTimeout),
       },
     },
@@ -324,7 +333,6 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
   const child = spawn(
     psqlBin,
     [
-      `--dbname=${opts.connectionString}`,
       "--set=ON_ERROR_STOP=1",
       "--quiet",
       "--no-psqlrc",
@@ -332,7 +340,7 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
     {
       stdio: ["pipe", "ignore", "pipe"],
       env: {
-        ...process.env,
+        ...createPostgresCliConnectionEnv(opts.connectionString, process.env),
         PGCONNECT_TIMEOUT: String(connectTimeout),
       },
     },
@@ -489,6 +497,26 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
       }
     },
   };
+}
+
+export function createPostgresCliConnectionEnv(
+  connectionString: string,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): PostgresCliConnectionEnv {
+  const parsed = new URL(connectionString);
+  const databaseName = parsed.pathname.replace(/^\//, "");
+  const env: PostgresCliConnectionEnv = { ...baseEnv };
+
+  if (parsed.hostname) env.PGHOST = parsed.hostname;
+  if (parsed.port) env.PGPORT = parsed.port;
+  if (databaseName) env.PGDATABASE = decodeURIComponent(databaseName);
+  if (parsed.username) env.PGUSER = decodeURIComponent(parsed.username);
+  if (parsed.password) env.PGPASSWORD = decodeURIComponent(parsed.password);
+
+  const sslMode = parsed.searchParams.get("sslmode");
+  if (sslMode) env.PGSSLMODE = sslMode;
+
+  return env;
 }
 
 export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise<RunDatabaseBackupResult> {
