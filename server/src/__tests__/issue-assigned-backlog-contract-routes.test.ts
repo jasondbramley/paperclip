@@ -137,6 +137,7 @@ function makeIssue(input: {
   id: string;
   title: string;
   status?: string;
+  priority?: string;
   parentId?: string | null;
   assigneeAgentId?: string | null;
 }) {
@@ -147,7 +148,7 @@ function makeIssue(input: {
     title: input.title,
     description: null,
     status: input.status ?? "todo",
-    priority: "medium",
+    priority: input.priority ?? "medium",
     parentId: input.parentId ?? null,
     assigneeAgentId: input.assigneeAgentId ?? null,
     assigneeUserId: null,
@@ -237,7 +238,7 @@ describe("assigned backlog creation contract", () => {
         details: expect.objectContaining({
           status: "todo",
           statusDefaulted: true,
-          statusDefaultReason: "assigned_omitted_status",
+          statusDefaultReason: "omitted_status",
           assignmentWakeSkipped: false,
         }),
       }),
@@ -281,7 +282,7 @@ describe("assigned backlog creation contract", () => {
         details: expect.objectContaining({
           status: "todo",
           statusDefaulted: true,
-          statusDefaultReason: "assigned_omitted_status",
+          statusDefaultReason: "omitted_status",
           assignmentWakeSkipped: false,
           parentBlockerAdded: true,
         }),
@@ -334,5 +335,36 @@ describe("assigned backlog creation contract", () => {
       }),
     );
     expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("defaults unassigned issue creation to todo and normalizes urgent priority to critical", async () => {
+    mockIssueService.create.mockImplementationOnce(async (_companyId: string, data: Record<string, unknown>) =>
+      makeIssue({
+        id: "issue-1",
+        title: String(data.title),
+        status: String(data.status),
+        priority: String(data.priority),
+      }));
+
+    const res = await request(await createApp())
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Incoming urgent work",
+        priority: "urgent",
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        title: "Incoming urgent work",
+        status: "todo",
+        priority: "critical",
+      }),
+    );
+    expect(res.body).toEqual(expect.objectContaining({
+      status: "todo",
+      priority: "critical",
+    }));
   });
 });

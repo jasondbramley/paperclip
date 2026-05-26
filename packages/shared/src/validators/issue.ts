@@ -41,6 +41,11 @@ export const issueBlockedInboxStateSchema = z.enum([
 
 export const issueBlockedInboxSeveritySchema = z.enum(["critical", "high", "medium", "low"]);
 
+const issuePriorityInputSchema = z.preprocess(
+  (value) => value === "urgent" ? "critical" : value,
+  z.enum(ISSUE_PRIORITIES),
+);
+
 export const issueBlockedInboxReasonSchema = z.enum([
   "blocked_by_unassigned_issue",
   "blocked_by_assigned_backlog_issue",
@@ -341,7 +346,7 @@ type IssueCreateStatusDefaultInput = {
 export function resolveCreateIssueStatusDefault(input: IssueCreateStatusDefaultInput): {
   status: (typeof ISSUE_STATUSES)[number];
   defaulted: boolean;
-  reason: "explicit" | "assigned_omitted_status" | "unassigned_omitted_status";
+  reason: "explicit" | "omitted_status";
 } {
   if (typeof input.status === "string") {
     return {
@@ -351,13 +356,10 @@ export function resolveCreateIssueStatusDefault(input: IssueCreateStatusDefaultI
     };
   }
 
-  const hasAssignee =
-    (typeof input.assigneeAgentId === "string" && input.assigneeAgentId.length > 0)
-    || (typeof input.assigneeUserId === "string" && input.assigneeUserId.length > 0);
   return {
-    status: hasAssignee ? "todo" : "backlog",
+    status: "todo",
     defaulted: true,
-    reason: hasAssignee ? "assigned_omitted_status" : "unassigned_omitted_status",
+    reason: "omitted_status",
   };
 }
 
@@ -384,7 +386,7 @@ const createIssueBaseSchema = z.object({
   description: multilineTextSchema.optional().nullable(),
   status: z.enum(ISSUE_STATUSES),
   workMode: z.enum(ISSUE_WORK_MODES).optional().default("standard"),
-  priority: z.enum(ISSUE_PRIORITIES).optional().default("medium"),
+  priority: issuePriorityInputSchema.optional().default("medium"),
   assigneeAgentId: z.string().uuid().optional().nullable(),
   assigneeUserId: z.string().optional().nullable(),
   requestDepth: issueRequestDepthInputSchema.optional().default(0),
@@ -600,7 +602,7 @@ export const suggestedTaskDraftSchema = z.object({
   parentId: z.string().uuid().nullable().optional(),
   title: z.string().trim().min(1).max(240),
   description: multilineTextSchema.pipe(z.string().trim().max(20000)).nullable().optional(),
-  priority: z.enum(ISSUE_PRIORITIES).nullable().optional(),
+  priority: issuePriorityInputSchema.nullable().optional(),
   workMode: z.enum(ISSUE_WORK_MODES).nullable().optional(),
   assigneeAgentId: z.string().uuid().nullable().optional(),
   assigneeUserId: z.string().trim().min(1).nullable().optional(),
