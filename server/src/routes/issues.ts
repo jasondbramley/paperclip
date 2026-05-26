@@ -1381,6 +1381,22 @@ export function issueRoutes(
     return true;
   }
 
+  async function assertAgentIssueCommentAllowed(
+    req: Request,
+    res: Response,
+    issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
+  ) {
+    if (req.actor.type !== "agent") return true;
+    if (!req.actor.agentId) {
+      res.status(403).json({ error: "Agent authentication required" });
+      return false;
+    }
+    if (!isClosedIssueStatus(issue.status)) {
+      return true;
+    }
+    return assertAgentIssueMutationAllowed(req, res, issue);
+  }
+
   function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
     if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
     const context = contextSnapshot as Record<string, unknown>;
@@ -5109,7 +5125,7 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    if (!(await assertAgentIssueCommentAllowed(req, res, issue))) return;
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
       metadata: req.body.metadata,
