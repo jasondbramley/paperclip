@@ -20,8 +20,10 @@ export {
 export {
   runDatabaseBackup,
   runDatabaseRestore,
+  createPostgresCliConnectionEnv,
   formatDatabaseBackupResult,
   type BackupRetentionPolicy,
+  type PostgresCliConnectionEnv,
   type RunDatabaseBackupOptions,
   type RunDatabaseBackupResult,
   type RunDatabaseRestoreOptions,

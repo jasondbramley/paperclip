@@ -3,7 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  createPostgresCliConnectionEnv,
+  runDatabaseBackup,
+  runDatabaseRestore,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -70,6 +75,25 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+  });
+});
+
+describe("createPostgresCliConnectionEnv", () => {
+  it("maps connection strings to libpq env vars so restore commands do not need secret argv values", () => {
+    const env = createPostgresCliConnectionEnv(
+      "postgres://paperclip:secret%20value@db.example.com:5432/paperclip_cutover?sslmode=require",
+      { PATH: "/usr/bin" },
+    );
+
+    expect(env).toMatchObject({
+      PATH: "/usr/bin",
+      PGHOST: "db.example.com",
+      PGPORT: "5432",
+      PGDATABASE: "paperclip_cutover",
+      PGUSER: "paperclip",
+      PGPASSWORD: "secret value",
+      PGSSLMODE: "require",
+    });
   });
 });
 
