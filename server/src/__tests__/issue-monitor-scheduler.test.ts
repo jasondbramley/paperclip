@@ -139,6 +139,9 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     agentStatus?: "active" | "paused";
     issueStatus?: "in_progress" | "in_review";
     monitorAttemptCount?: number;
+    heartbeatEnabled?: boolean;
+    heartbeatIntervalSec?: number;
+    lastHeartbeatAt?: Date;
     monitor?: Record<string, unknown>;
   }) {
     const companyId = randomUUID();
@@ -176,11 +179,13 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       },
       runtimeConfig: {
         heartbeat: {
-          enabled: false,
+          enabled: input?.heartbeatEnabled ?? false,
+          intervalSec: input?.heartbeatIntervalSec ?? 600,
           wakeOnDemand: true,
         },
       },
       permissions: {},
+      lastHeartbeatAt: input?.lastHeartbeatAt ?? null,
     });
     seededAgentIds.add(agentId);
 
@@ -446,5 +451,34 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(activityLog.entityId, issueId));
     expect(JSON.stringify(activity.map((row) => row.details))).not.toContain("provider.example");
     expect(activity.find((row) => row.action === "issue.monitor_triggered")?.details).not.toHaveProperty("externalRef");
+  });
+
+  it("skips timer-based heartbeat when no immediate work is available", async () => {
+    const { agentId } = await seedFixture({
+      heartbeatEnabled: true,
+      heartbeatIntervalSec: 60,
+      lastHeartbeatAt: new Date("2026-04-11T12:00:00.000Z"),
+    });
+    const heartbeat = heartbeatService(db);
+    const tickAt = new Date("2026-04-11T12:02:00.000Z");
+
+    const result = await heartbeat.tickTimers(tickAt);
+
+    expect(result.enqueued).toBe(0);
+    expect(result.skipped).toBe(1);
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.map((row) => row.id));
+    expect(wakeup).toHaveLength(0);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then((rows) => rows.map((row) => row.id));
+    expect(runs).toHaveLength(0);
   });
 });

@@ -17,6 +17,8 @@ export const runningProcesses: Map<string, { child: ChildProcess; graceSec: numb
   serverUtils.runningProcesses;
 export const MAX_CAPTURE_BYTES = serverUtils.MAX_CAPTURE_BYTES;
 export const MAX_EXCERPT_BYTES = serverUtils.MAX_EXCERPT_BYTES;
+export const MAX_TOOL_RESULT_BYTES = serverUtils.MAX_TOOL_RESULT_BYTES;
+export const TOOL_RESULT_TEXT_TRUNCATION_PREFIX = serverUtils.TOOL_RESULT_TEXT_TRUNCATION_PREFIX;
 export const parseObject = serverUtils.parseObject;
 export const asString = serverUtils.asString;
 export const asNumber = serverUtils.asNumber;
@@ -25,6 +27,7 @@ export const asStringArray = serverUtils.asStringArray;
 export const parseJson = serverUtils.parseJson;
 export const appendWithCap = serverUtils.appendWithCap;
 export const appendWithByteCap = serverUtils.appendWithByteCap;
+export const trimToolResultText = serverUtils.trimToolResultText;
 export const resolvePathValue = serverUtils.resolvePathValue;
 export const renderTemplate = serverUtils.renderTemplate;
 export const redactEnvForLogs = serverUtils.redactEnvForLogs;

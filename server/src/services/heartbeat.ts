@@ -205,9 +205,11 @@ const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+const HEARTBEAT_TIMER_WORK_WAKEUP_STATUSES = ["queued", "deferred_issue_execution", "claimed"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+const HEARTBEAT_TIMER_DUE_MONITOR_STALE_CLAIM_MS = 5 * 60 * 1000;
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -3286,6 +3288,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       triggered,
       skipped,
     };
+  }
+
+  async function agentHasImmediateHeartbeatWork(agent: typeof agents.$inferSelect, now: Date) {
+    const staleClaimThreshold = new Date(now.getTime() - HEARTBEAT_TIMER_DUE_MONITOR_STALE_CLAIM_MS);
+    const [activeRuns, pendingWakeups, dueMonitors] = await Promise.all([
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agent.id),
+            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+          ),
+        )
+        .limit(1),
+      db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, agent.companyId),
+            eq(agentWakeupRequests.agentId, agent.id),
+            inArray(agentWakeupRequests.status, [...HEARTBEAT_TIMER_WORK_WAKEUP_STATUSES]),
+          ),
+        )
+        .limit(1),
+      db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, agent.companyId),
+            isNull(issues.assigneeUserId),
+            eq(issues.assigneeAgentId, agent.id),
+            sql`${issues.monitorNextCheckAt} is not null`,
+            lte(issues.monitorNextCheckAt, now),
+            inArray(issues.status, ["in_progress", "in_review"]),
+            or(isNull(issues.monitorWakeRequestedAt), lt(issues.monitorWakeRequestedAt, staleClaimThreshold)),
+          ),
+        )
+        .limit(1),
+    ]);
+
+    return (
+      activeRuns.length > 0 ||
+      pendingWakeups.length > 0 ||
+      dueMonitors.length > 0
+    );
   }
 
   async function getOldestRunForSession(agentId: string, sessionId: string) {
@@ -9885,6 +9935,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
+
+        const hasImmediateWork = await agentHasImmediateHeartbeatWork(agent, now);
+        if (!hasImmediateWork) {
+          skipped += 1;
+          continue;
+        }
 
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
