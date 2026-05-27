@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
+  MAX_TOOL_RESULT_BYTES,
   buildInvocationEnvForLogs,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   materializePaperclipSkillCopy,
@@ -16,7 +17,9 @@ import {
   sanitizeSshRemoteEnv,
   shapePaperclipWorkspaceEnvForExecution,
   rewriteWorkspaceCwdEnvVarsForExecution,
+  TOOL_RESULT_TEXT_TRUNCATION_PREFIX,
   stringifyPaperclipWakePayload,
+  trimToolResultText,
 } from "./server-utils.js";
 
 function isPidAlive(pid: number) {
@@ -977,5 +980,25 @@ describe("appendWithByteCap", () => {
     expect(output).not.toContain("\uFFFD");
     expect(Buffer.from(output, "utf8").toString("utf8")).toBe(output);
     expect(Buffer.byteLength(output, "utf8")).toBeLessThanOrEqual(7);
+  });
+});
+
+describe("trimToolResultText", () => {
+  it("does not mutate content that fits under cap", () => {
+    expect(trimToolResultText("short output", 100)).toBe("short output");
+  });
+
+  it("truncates oversized content and keeps a truncation marker", () => {
+    const output = trimToolResultText("x".repeat(30000), 64);
+
+    expect(Buffer.byteLength(output, "utf8")).toBeLessThanOrEqual(64);
+    expect(output).toContain(TOOL_RESULT_TEXT_TRUNCATION_PREFIX);
+  });
+
+  it("preserves UTF-8 validity under truncation", () => {
+    const output = trimToolResultText("prefix — emoji 😀".repeat(4000), MAX_TOOL_RESULT_BYTES);
+
+    expect(output).not.toContain("\uFFFD");
+    expect(Buffer.from(output, "utf8").toString("utf8")).toBe(output);
   });
 });

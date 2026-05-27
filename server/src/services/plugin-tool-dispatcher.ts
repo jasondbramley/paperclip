@@ -39,6 +39,7 @@ import {
 } from "./plugin-tool-registry.js";
 import { pluginRegistryService } from "./plugin-registry.js";
 import { logger } from "../middleware/logger.js";
+import { trimToolResultText } from "../adapters/utils.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -412,6 +413,13 @@ export function createPluginToolDispatcher(
         parameters,
         runContext,
       );
+
+      if (typeof result.result.content === "string") {
+        result.result.content = trimToolResultText(result.result.content);
+      }
+      if (typeof result.result.data === "string") {
+        result.result.data = trimToolResultText(result.result.data);
+      }
 
       log.debug(
         {

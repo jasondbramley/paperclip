@@ -78,6 +78,8 @@ function signalRunningProcess(
 export const runningProcesses = new Map<string, RunningProcess>();
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
+export const MAX_TOOL_RESULT_BYTES = 32 * 1024;
+export const TOOL_RESULT_TEXT_TRUNCATION_PREFIX = "[tool result truncated; tail retained]";
 const TERMINAL_RESULT_SCAN_OVERLAP_CHARS = 64 * 1024;
 const DEFAULT_PAPERCLIP_INSTANCE_ID = "default";
 const PATH_SEGMENT_RE = /^[a-zA-Z0-9_-]+$/;
@@ -257,6 +259,18 @@ export function appendWithByteCap(prev: string, chunk: string, cap = MAX_CAPTURE
   let start = Math.max(0, bytes - cap);
   while (start < buffer.length && (buffer[start]! & 0xc0) === 0x80) start += 1;
   return buffer.subarray(start).toString("utf8");
+}
+
+export function trimToolResultText(value: string, cap = MAX_TOOL_RESULT_BYTES): string {
+  if (Buffer.byteLength(value, "utf8") <= cap) return value;
+
+  const keepBytes = Math.max(0, cap - Buffer.byteLength(TOOL_RESULT_TEXT_TRUNCATION_PREFIX, "utf8") - 1);
+  if (keepBytes <= 0) {
+    return appendWithByteCap("", TOOL_RESULT_TEXT_TRUNCATION_PREFIX, cap);
+  }
+
+  const tail = appendWithByteCap("", value, keepBytes);
+  return `${TOOL_RESULT_TEXT_TRUNCATION_PREFIX} ${tail}`;
 }
 
 function resumeReadable(readable: { resume: () => unknown; destroyed?: boolean } | null | undefined) {

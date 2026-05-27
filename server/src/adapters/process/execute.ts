@@ -9,6 +9,7 @@ import {
   ensurePathInEnv,
   resolveCommandForLogs,
   runChildProcess,
+  trimToolResultText,
 } from "../utils.js";
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -51,6 +52,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     graceSec,
     onLog,
   });
+  const trimmedStdout = trimToolResultText(proc.stdout);
+  const trimmedStderr = trimToolResultText(proc.stderr);
 
   if (proc.timedOut) {
     return {
@@ -58,6 +61,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       signal: proc.signal,
       timedOut: true,
       errorMessage: `Timed out after ${timeoutSec}s`,
+      resultJson: {
+        stdout: trimmedStdout,
+        stderr: trimmedStderr,
+      },
     };
   }
 
@@ -68,8 +75,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timedOut: false,
       errorMessage: `Process exited with code ${proc.exitCode ?? -1}`,
       resultJson: {
-        stdout: proc.stdout,
-        stderr: proc.stderr,
+        stdout: trimmedStdout,
+        stderr: trimmedStderr,
       },
     };
   }
@@ -79,8 +86,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     signal: proc.signal,
     timedOut: false,
     resultJson: {
-      stdout: proc.stdout,
-      stderr: proc.stderr,
+      stdout: trimmedStdout,
+      stderr: trimmedStderr,
     },
   };
 }
