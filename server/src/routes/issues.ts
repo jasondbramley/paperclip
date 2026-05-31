@@ -4375,7 +4375,10 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    // Tier A: plain comment posting is open to any agent in the same company.
+    // Tier B: reopen/resume mutate issue state, still require assignee ownership.
+    const commentMutatesState = req.body.reopen === true || req.body.resume === true;
+    if (commentMutatesState && !(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
       metadata: req.body.metadata,

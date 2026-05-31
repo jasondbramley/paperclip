@@ -364,7 +364,6 @@ describe("agent issue mutation checkout ownership", () => {
   it.each([
     ["patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Blocked" })],
     ["delete", (app: express.Express) => request(app).delete(`/api/issues/${issueId}`)],
-    ["comment", (app: express.Express) => request(app).post(`/api/issues/${issueId}/comments`).send({ body: "blocked" })],
     [
       "document upsert",
       (app: express.Express) =>
@@ -445,7 +444,6 @@ describe("agent issue mutation checkout ownership", () => {
 
   it.each([
     ["todo", "patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Todo update" })],
-    ["todo", "comment", (app: express.Express) => request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Todo noise" })],
     ["blocked", "patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Blocked update" })],
   ])("rejects peer agent %s issue %s mutations outside active checkout ownership", async (status, _kind, sendRequest) => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: status as "todo" | "blocked", assigneeAgentId: ownerAgentId }));
@@ -456,6 +454,42 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
     expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["in_progress", makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId })],
+    ["todo", makeIssue({ status: "todo", assigneeAgentId: ownerAgentId })],
+    ["blocked", makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId })],
+    ["in_review", makeIssue({ status: "in_review", assigneeAgentId: ownerAgentId })],
+  ])("allows peer agent to post a plain comment on a %s issue owned by another agent", async (_status, issue) => {
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Cross-agent progress update" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Cross-agent progress update",
+      expect.objectContaining({ agentId: peerAgentId }),
+      expect.any(Object),
+    );
+  });
+
+  it.each([
+    ["reopen", { body: "Reopening this", reopen: true }],
+    ["resume", { body: "Resuming this", resume: true }],
+  ])("rejects peer agent %s comment as a Tier B mutation on another agents todo issue", async (_kind, body) => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send(body);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
