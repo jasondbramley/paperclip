@@ -18,6 +18,7 @@ import {
   type IssueExecutionMonitorPolicy,
   type IssueExecutionMonitorRecoveryPolicy,
   type ModelProfileKey,
+  type RoutineRevisionSnapshotV1,
   type RunLivenessState,
 } from "@paperclipai/shared";
 import {
@@ -40,6 +41,9 @@ import {
   issueWorkProducts,
   projects,
   projectWorkspaces,
+  routineRevisions,
+  routineRuns,
+  routines,
   workspaceOperations,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
@@ -327,19 +331,44 @@ type RuntimeConfigSecretResolver = Pick<
   "resolveAdapterConfigForRuntime" | "resolveEnvBindings"
 >;
 
+function isPaperclipRuntimeEnvKey(key: string) {
+  return key.startsWith("PAPERCLIP_");
+}
+
+function stripPaperclipRuntimeEnvBindings(envValue: unknown): Record<string, unknown> | null {
+  const record = parseObject(envValue);
+  const filtered = Object.fromEntries(
+    Object.entries(record).filter(([key]) => !isPaperclipRuntimeEnvKey(key)),
+  );
+  return Object.keys(filtered).length > 0 ? filtered : null;
+}
+
+function stripPaperclipRuntimeEnvFromAdapterConfig(config: Record<string, unknown>): Record<string, unknown> {
+  if (!Object.prototype.hasOwnProperty.call(config, "env")) return config;
+  return {
+    ...config,
+    env: stripPaperclipRuntimeEnvBindings(config.env) ?? {},
+  };
+}
+
 export async function resolveExecutionRunAdapterConfig(input: {
   companyId: string;
   agentId?: string | null;
   issueId?: string | null;
   heartbeatRunId?: string | null;
   projectId?: string | null;
+  routineId?: string | null;
   executionRunConfig: Record<string, unknown>;
   projectEnv: unknown;
+  routineEnv?: unknown;
   secretsSvc: RuntimeConfigSecretResolver;
 }) {
+  const executionRunConfig = stripPaperclipRuntimeEnvFromAdapterConfig(input.executionRunConfig);
+  const projectEnv = stripPaperclipRuntimeEnvBindings(input.projectEnv);
+  const routineEnv = stripPaperclipRuntimeEnvBindings(input.routineEnv);
   const { config: resolvedConfig, secretKeys, manifest } = await input.secretsSvc.resolveAdapterConfigForRuntime(
     input.companyId,
-    input.executionRunConfig,
+    executionRunConfig,
     input.agentId
       ? {
           consumerType: "agent",
@@ -351,10 +380,10 @@ export async function resolveExecutionRunAdapterConfig(input: {
         }
       : undefined,
   );
-  const projectEnvResolution = input.projectEnv
+  const projectEnvResolution = projectEnv
     ? await input.secretsSvc.resolveEnvBindings(
         input.companyId,
-        input.projectEnv,
+        projectEnv,
         input.projectId
           ? {
               consumerType: "project",
@@ -376,10 +405,39 @@ export async function resolveExecutionRunAdapterConfig(input: {
       secretKeys.add(key);
     }
   }
+  const routineEnvResolution = routineEnv
+    ? await input.secretsSvc.resolveEnvBindings(
+        input.companyId,
+        routineEnv,
+        input.routineId
+          ? {
+              consumerType: "routine",
+              consumerId: input.routineId,
+              actorType: "agent",
+              actorId: input.agentId ?? null,
+              issueId: input.issueId ?? null,
+              heartbeatRunId: input.heartbeatRunId ?? null,
+            }
+          : undefined,
+      )
+    : { env: {}, secretKeys: new Set<string>(), manifest: [] };
+  if (Object.keys(routineEnvResolution.env).length > 0) {
+    resolvedConfig.env = {
+      ...parseObject(resolvedConfig.env),
+      ...routineEnvResolution.env,
+    };
+    for (const key of routineEnvResolution.secretKeys) {
+      secretKeys.add(key);
+    }
+  }
   return {
     resolvedConfig,
     secretKeys,
-    secretManifest: [...(manifest ?? []), ...(projectEnvResolution.manifest ?? [])],
+    secretManifest: [
+      ...(manifest ?? []),
+      ...(projectEnvResolution.manifest ?? []),
+      ...(routineEnvResolution.manifest ?? []),
+    ],
   };
 }
 
@@ -1271,6 +1329,103 @@ function didAutomaticRecoveryFail(
       latestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
     )
   );
+}
+
+const CONTEXT_OVERFLOW_FAILURE_PATTERN = /(context window|adapter_failed.*context|maximum context length)/i;
+const STREAM_DISCONNECT_FAILURE_PATTERN =
+  /(stream disconnected before completion|response\.failed event received|transport error:\s*timeout|adapter_failed\s*[-–]\s*stream\s+disconnected|HTTP[/ ]\s*5\d\d)/i;
+const AUTO_RESET_WINDOW_MS = 60 * 60 * 1000;
+const AUTO_RESET_LIMIT_PER_HOUR = 2;
+const STREAM_DISCONNECT_RETRY_LIMIT = 2;
+const STREAM_DISCONNECT_RETRY_DELAY_MS_MIN = 10_000;
+const STREAM_DISCONNECT_RETRY_DELAY_MS_MAX = 15_000;
+const STREAM_DISCONNECT_CROSS_HEARTBEAT_WINDOW_MS = 30 * 60 * 1000;
+const STREAM_DISCONNECT_CROSS_HEARTBEAT_ESCALATION_LIMIT = 9;
+
+type AutoResetState = {
+  windowStartedAt?: string;
+  attempts?: number;
+};
+
+function matchesContextOverflowFailure(reason: string | null | undefined) {
+  return Boolean(reason && CONTEXT_OVERFLOW_FAILURE_PATTERN.test(reason));
+}
+
+function matchesStreamDisconnectFailure(reason: string | null | undefined) {
+  return Boolean(reason && STREAM_DISCONNECT_FAILURE_PATTERN.test(reason));
+}
+
+function readRecoveryRetryCount(contextSnapshot: unknown) {
+  const context = parseObject(contextSnapshot);
+  const raw = context.retry_count;
+  return typeof raw === "number" && Number.isFinite(raw) && raw >= 0
+    ? Math.floor(raw)
+    : 0;
+}
+
+function readAutoResetState(stateJson: Record<string, unknown> | null | undefined): AutoResetState {
+  const root = parseObject(stateJson);
+  const recovery = parseObject(root.autoRecovery);
+  const contextOverflow = parseObject(recovery.contextOverflow);
+  const windowStartedAt = readNonEmptyString(contextOverflow.windowStartedAt) ?? undefined;
+  const attempts = typeof contextOverflow.attempts === "number" && Number.isFinite(contextOverflow.attempts)
+    ? Math.max(0, Math.floor(contextOverflow.attempts))
+    : 0;
+  return { windowStartedAt, attempts };
+}
+
+function nextAutoResetState(
+  previous: AutoResetState,
+  now: Date,
+): { nextState: AutoResetState; attemptsInWindow: number } {
+  const previousWindow = previous.windowStartedAt ? new Date(previous.windowStartedAt) : null;
+  const previousWindowValid = previousWindow && !Number.isNaN(previousWindow.getTime());
+  const sameWindow =
+    Boolean(previousWindowValid) &&
+    now.getTime() - (previousWindow as Date).getTime() < AUTO_RESET_WINDOW_MS;
+  const attemptsInWindow = sameWindow ? (previous.attempts ?? 0) + 1 : 1;
+  return {
+    attemptsInWindow,
+    nextState: {
+      windowStartedAt: sameWindow ? previous.windowStartedAt : now.toISOString(),
+      attempts: attemptsInWindow,
+    },
+  };
+}
+
+type StreamDisconnectState = {
+  windowStartedAt?: string;
+  attempts?: number;
+};
+
+function readStreamDisconnectState(stateJson: Record<string, unknown> | null | undefined): StreamDisconnectState {
+  const root = parseObject(stateJson);
+  const recovery = parseObject(root.autoRecovery);
+  const sd = parseObject(recovery.streamDisconnect);
+  const windowStartedAt = readNonEmptyString(sd.windowStartedAt) ?? undefined;
+  const attempts = typeof sd.attempts === "number" && Number.isFinite(sd.attempts)
+    ? Math.max(0, Math.floor(sd.attempts))
+    : 0;
+  return { windowStartedAt, attempts };
+}
+
+function nextStreamDisconnectState(
+  previous: StreamDisconnectState,
+  now: Date,
+): { nextState: StreamDisconnectState; attemptsInWindow: number } {
+  const previousWindow = previous.windowStartedAt ? new Date(previous.windowStartedAt) : null;
+  const previousWindowValid = previousWindow && !Number.isNaN(previousWindow.getTime());
+  const sameWindow =
+    Boolean(previousWindowValid) &&
+    now.getTime() - (previousWindow as Date).getTime() < STREAM_DISCONNECT_CROSS_HEARTBEAT_WINDOW_MS;
+  const attemptsInWindow = sameWindow ? (previous.attempts ?? 0) + 1 : 1;
+  return {
+    attemptsInWindow,
+    nextState: {
+      windowStartedAt: sameWindow ? previous.windowStartedAt : now.toISOString(),
+      attempts: attemptsInWindow,
+    },
+  };
 }
 
 function normalizeLedgerBillingType(value: unknown): BillingType {
@@ -2433,10 +2588,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         assigneeAgentId: issues.assigneeAgentId,
         assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
         executionWorkspaceSettings: issues.executionWorkspaceSettings,
+        originKind: issues.originKind,
+        originId: issues.originId,
+        originRunId: issues.originRunId,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function getRoutineEnvForExecutionIssue(
+    companyId: string,
+    issueContext: Awaited<ReturnType<typeof getIssueExecutionContext>> | null,
+  ) {
+    // TODO(ITO-2142 follow-up): restore env lookup once routines.env + routineRuns.routineRevisionId
+    // schema columns and RoutineRevisionSnapshotRoutineV1.env property land in jasondbramley/paperclip
+    // master. Currently those exist in upstream paperclipai but not here.
+    void companyId;
+    if (!issueContext || issueContext.originKind !== "routine_execution" || !issueContext.originId) {
+      return { routineId: null, env: null };
+    }
+    return { routineId: issueContext.originId, env: null };
   }
 
   async function getRuntimeState(agentId: string) {
@@ -2672,7 +2844,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           projectId: input.claimed.projectId,
           goalId: input.claimed.goalId,
           assigneeAgentId: input.claimed.assigneeAgentId,
-          assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides(),
+          assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
           originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
           originId: input.claimed.id,
           originFingerprint: `issue_monitor:${input.clearReason}`,
@@ -2686,7 +2858,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail: "system",
           reason: "issue_monitor_recovery_issue",
           idempotencyKey: `issue-monitor-recovery-issue:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
-          payload: withRecoveryModelProfileHint({ issueId: recoveryIssue.id, sourceIssueId: input.claimed.id }),
+          payload: withRecoveryModelProfileHint({ issueId: recoveryIssue.id, sourceIssueId: input.claimed.id }, "status_only"),
           requestedByActorType: input.actorType,
           requestedByActorId: input.actorId,
           contextSnapshot: withRecoveryModelProfileHint({
@@ -2694,7 +2866,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             sourceIssueId: input.claimed.id,
             source: "issue.monitor.recovery_issue",
             wakeReason: "issue_monitor_recovery_issue",
-          }),
+          }, "status_only"),
         });
       }
 
@@ -2755,7 +2927,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         serviceName: input.monitor?.serviceName ?? null,
         timeoutAt: input.monitor?.timeoutAt ?? null,
         maxAttempts: input.monitor?.maxAttempts ?? null,
-      }),
+      }, "status_only"),
       requestedByActorType: input.actorType,
       requestedByActorId: input.actorId,
       contextSnapshot: withRecoveryModelProfileHint({
@@ -2768,7 +2940,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         serviceName: input.monitor?.serviceName ?? null,
         timeoutAt: input.monitor?.timeoutAt ?? null,
         maxAttempts: input.monitor?.maxAttempts ?? null,
-      }),
+      }, "status_only"),
     });
 
     await logActivity(db, {
@@ -4249,7 +4421,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ) {
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const sanitizedMessage = event.message
-      ? redactSensitiveText(redactCurrentUserText(event.message, currentUserRedactionOptions))
+      ? redactCurrentUserText(event.message, currentUserRedactionOptions)
       : event.message;
     const boundedPayload = event.payload
       ? boundHeartbeatRunEventPayloadForStorage(event.payload)
@@ -4422,7 +4594,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       wakeReason: "missing_issue_comment",
       retryReason: "missing_issue_comment",
       missingIssueCommentForRunId: run.id,
-    });
+    }, "status_only");
     const now = new Date();
 
     const retryRun = await db.transaction(async (tx) => {
@@ -4449,7 +4621,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issueId,
             retryOfRunId: run.id,
             retryReason: "missing_issue_comment",
-          }),
+          }, "status_only"),
           status: "queued",
           requestedByActorType: "system",
           requestedByActorId: null,
@@ -4642,7 +4814,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       retryOfRunId: run.id,
       wakeReason: "process_lost_retry",
       retryReason: "process_lost",
-    });
+    }, "normal_model");
 
     const queued = await db.transaction(async (tx) => {
       const wakeupRequest = await tx
@@ -4656,7 +4828,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           payload: withRecoveryModelProfileHint({
             ...(issueId ? { issueId } : {}),
             retryOfRunId: run.id,
-          }),
+          }, "normal_model"),
           status: "queued",
           requestedByActorType: "system",
           requestedByActorId: null,
@@ -5209,7 +5381,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       scheduledRetryAt: schedule.dueAt.toISOString(),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
-    });
+    }, "normal_model");
     const maxTurnContinuationIdempotencyKey = retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
       ? `max-turn-continuation:${run.companyId}:${issueId ?? "no-issue"}:${run.id}:${schedule.attempt}`
       : null;
@@ -5379,7 +5551,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             scheduledRetryAt: schedule.dueAt.toISOString(),
             ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
             ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
-          }),
+          }, "normal_model"),
           status: "queued",
           requestedByActorType: "system",
           requestedByActorId: null,
@@ -6870,6 +7042,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(and(eq(projects.id, executionProjectId), eq(projects.companyId, agent.companyId)))
           .then((rows) => rows[0] ?? null)
       : null;
+    const routineEnvContext = await getRoutineEnvForExecutionIssue(agent.companyId, issueContext);
     const projectExecutionWorkspacePolicy = gateProjectExecutionWorkspacePolicy(
       parseProjectExecutionWorkspacePolicy(projectContext?.executionWorkspacePolicy),
       isolatedWorkspacesEnabled,
@@ -7074,8 +7247,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueId,
       heartbeatRunId: run.id,
       projectId: projectContext?.id ?? null,
+      routineId: routineEnvContext.routineId,
       executionRunConfig,
       projectEnv: projectContext?.env ?? null,
+      routineEnv: routineEnvContext.env,
       secretsSvc,
     });
     if (secretManifest.length > 0) {
@@ -7530,7 +7705,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
         const sanitizedChunk = compactRunLogChunk(
-          redactCurrentUserText(chunk, currentUserRedactionOptions),
+          redactSensitiveText(redactCurrentUserText(chunk, currentUserRedactionOptions)),
         );
         if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
         if (stream === "stderr") stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
@@ -8413,6 +8588,300 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
+      const failureReason = readNonEmptyString(run.error);
+      const retryCount = readRecoveryRetryCount(run.contextSnapshot);
+      const isStreamDisconnect = matchesStreamDisconnectFailure(failureReason);
+      const isContextOverflow = matchesContextOverflowFailure(failureReason);
+
+      if (isStreamDisconnect && recoveryAgentInvokable && recoveryAgent) {
+        const now = new Date();
+
+        // Track cross-heartbeat stream-disconnect failures in runtime state.
+        const runtimeState = await tx
+          .select()
+          .from(agentRuntimeState)
+          .where(eq(agentRuntimeState.agentId, recoveryAgent.id))
+          .then((rows) => rows[0] ?? null);
+        const currentSdState = readStreamDisconnectState(runtimeState?.stateJson);
+        const { nextState: nextSdState, attemptsInWindow } = nextStreamDisconnectState(currentSdState, now);
+        const rootStateJson = parseObject(runtimeState?.stateJson);
+        const autoRecovery = parseObject(rootStateJson.autoRecovery);
+        await tx
+          .insert(agentRuntimeState)
+          .values({
+            agentId: recoveryAgent.id,
+            companyId: recoveryAgent.companyId,
+            adapterType: recoveryAgent.adapterType,
+            stateJson: {
+              ...rootStateJson,
+              autoRecovery: {
+                ...autoRecovery,
+                streamDisconnect: nextSdState,
+              },
+            },
+            updatedAt: now,
+          })
+          .onConflictDoUpdate({
+            target: agentRuntimeState.agentId,
+            set: {
+              stateJson: {
+                ...rootStateJson,
+                autoRecovery: {
+                  ...autoRecovery,
+                  streamDisconnect: nextSdState,
+                },
+              },
+              updatedAt: now,
+            },
+          });
+
+        // Cross-heartbeat escalation: persistent network instability detected.
+        if (attemptsInWindow >= STREAM_DISCONNECT_CROSS_HEARTBEAT_ESCALATION_LIMIT) {
+          await issuesSvc.addComment(
+            issue.id,
+            `Blocker: Jason Bramley — Persistent stream-disconnect failures: ${attemptsInWindow} failed attempts in the last 30 minutes across multiple heartbeat cycles. Network instability suspected. Manual review required before further retries.`,
+            { agentId: recoveryAgent.id, runId: run.id },
+            { authorType: "agent" },
+          );
+          return {
+            kind: "blocked_stream_disconnect" as const,
+            issue,
+            previousStatus: issue.status,
+          };
+        }
+
+        if (retryCount < STREAM_DISCONNECT_RETRY_LIMIT) {
+          // Retry with a jittered delay so the network can stabilise before re-connecting.
+          const delayMs = STREAM_DISCONNECT_RETRY_DELAY_MS_MIN +
+            Math.floor(Math.random() * (STREAM_DISCONNECT_RETRY_DELAY_MS_MAX - STREAM_DISCONNECT_RETRY_DELAY_MS_MIN));
+          const scheduledRetryAt = new Date(now.getTime() + delayMs);
+          const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
+          const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
+          const recoverySource =
+            issue.status === "todo" ? "issue.assignment_recovery" : "issue.continuation_recovery";
+
+          const wakeupRequest = await tx
+            .insert(agentWakeupRequests)
+            .values({
+              companyId: issue.companyId,
+              agentId: recoveryAgent.id,
+              source: "automation",
+              triggerDetail: "system",
+              reason: recoveryReason,
+              payload: withRecoveryModelProfileHint({
+                issueId: issue.id,
+                retryOfRunId: run.id,
+                retry_count: retryCount + 1,
+              }, "normal_model"),
+              status: "queued",
+              requestedByActorType: "system",
+              requestedByActorId: null,
+              updatedAt: now,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+
+          const scheduledRun = await tx
+            .insert(heartbeatRuns)
+            .values({
+              companyId: issue.companyId,
+              agentId: recoveryAgent.id,
+              invocationSource: "automation",
+              triggerDetail: "system",
+              status: "scheduled_retry",
+              scheduledRetryAt,
+              scheduledRetryAttempt: 1,
+              scheduledRetryReason: "stream_disconnect_retry",
+              wakeupRequestId: wakeupRequest.id,
+              contextSnapshot: withRecoveryModelProfileHint({
+                issueId: issue.id,
+                taskId: issue.id,
+                wakeReason: recoveryReason,
+                retryReason,
+                source: recoverySource,
+                retryOfRunId: run.id,
+                retry_count: retryCount + 1,
+                stream_disconnect_resume_notice:
+                  "If you are resuming after a stream-disconnect retry, do a quick state check before starting new tool work — your last attempt may have left partial side effects.",
+              }, "normal_model"),
+              sessionIdBefore: recoverySessionBefore,
+              retryOfRunId: run.id,
+              updatedAt: now,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              runId: scheduledRun.id,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+          await tx
+            .update(issues)
+            .set({
+              executionRunId: scheduledRun.id,
+              executionAgentNameKey: recoveryAgentNameKey,
+              executionLockedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(issues.id, issue.id));
+
+          return {
+            kind: "queued_recovery" as const,
+            run: scheduledRun,
+          };
+        }
+
+        // Retry limit exhausted — mark blocked with an untagged comment (no Blocker: prefix)
+        // so this network event does not mirror to staff Teams channels.
+        await issuesSvc.addComment(
+          issue.id,
+          `Stream-disconnect retry limit reached after ${STREAM_DISCONNECT_RETRY_LIMIT} attempts. Network event: ${failureReason ?? "stream disconnect"}. Moving issue to blocked pending manual review.`,
+          { agentId: recoveryAgent.id, runId: run.id },
+          { authorType: "agent" },
+        );
+        return {
+          kind: "blocked_stream_disconnect" as const,
+          issue,
+          previousStatus: issue.status,
+        };
+      }
+
+      if (isContextOverflow && recoveryAgentInvokable && recoveryAgent) {
+        const runtimeState = await tx
+          .select()
+          .from(agentRuntimeState)
+          .where(eq(agentRuntimeState.agentId, recoveryAgent.id))
+          .then((rows) => rows[0] ?? null);
+        const now = new Date();
+        const currentResetState = readAutoResetState(runtimeState?.stateJson);
+        const { nextState, attemptsInWindow } = nextAutoResetState(currentResetState, now);
+
+        if (attemptsInWindow <= AUTO_RESET_LIMIT_PER_HOUR) {
+          const rootState = parseObject(runtimeState?.stateJson);
+          const autoRecovery = parseObject(rootState.autoRecovery);
+          await tx
+            .insert(agentRuntimeState)
+            .values({
+              agentId: recoveryAgent.id,
+              companyId: recoveryAgent.companyId,
+              adapterType: recoveryAgent.adapterType,
+              stateJson: {
+                ...rootState,
+                autoRecovery: {
+                  ...autoRecovery,
+                  contextOverflow: nextState,
+                },
+              },
+              updatedAt: now,
+            })
+            .onConflictDoUpdate({
+              target: agentRuntimeState.agentId,
+              set: {
+                companyId: recoveryAgent.companyId,
+                adapterType: recoveryAgent.adapterType,
+                stateJson: {
+                  ...rootState,
+                  autoRecovery: {
+                    ...autoRecovery,
+                    contextOverflow: nextState,
+                  },
+                },
+                updatedAt: now,
+              },
+            });
+
+          const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
+          const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
+          const recoverySource =
+            issue.status === "todo" ? "issue.assignment_recovery" : "issue.continuation_recovery";
+          const resetTaskKey = deriveTaskKeyWithHeartbeatFallback(run.contextSnapshot, null);
+          const resetCommentTs = now.toISOString();
+
+          const wakeupRequest = await tx
+            .insert(agentWakeupRequests)
+            .values({
+              companyId: issue.companyId,
+              agentId: recoveryAgent.id,
+              source: "automation",
+              triggerDetail: "system",
+              reason: recoveryReason,
+              payload: withRecoveryModelProfileHint({
+                issueId: issue.id,
+                retryOfRunId: run.id,
+                retry_count: 0,
+                auto_reset_after_context_overflow: true,
+              }, "normal_model"),
+              status: "queued",
+              requestedByActorType: "system",
+              requestedByActorId: null,
+              updatedAt: now,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+
+          const queuedRun = await tx
+            .insert(heartbeatRuns)
+            .values({
+              companyId: issue.companyId,
+              agentId: recoveryAgent.id,
+              invocationSource: "automation",
+              triggerDetail: "system",
+              status: "queued",
+              wakeupRequestId: wakeupRequest.id,
+              contextSnapshot: withRecoveryModelProfileHint({
+                issueId: issue.id,
+                taskId: issue.id,
+                wakeReason: recoveryReason,
+                retryReason,
+                source: recoverySource,
+                retryOfRunId: run.id,
+                retry_count: 0,
+                auto_reset_after_context_overflow: true,
+              }, "normal_model"),
+              sessionIdBefore: null,
+              retryOfRunId: run.id,
+              updatedAt: now,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              runId: queuedRun.id,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+          await tx
+            .update(issues)
+            .set({
+              executionRunId: queuedRun.id,
+              executionAgentNameKey: recoveryAgentNameKey,
+              executionLockedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(issues.id, issue.id));
+
+          await issuesSvc.addComment(
+            issue.id,
+            `Auto-reset session after context overflow at ${resetCommentTs}. Retry in progress.`,
+            { agentId: recoveryAgent.id, runId: queuedRun.id },
+            { authorType: "agent" },
+          );
+          // Session-reset occurs via the new run's sessionIdBefore: null which forces a fresh session.
+
+          return {
+            kind: "queued_recovery" as const,
+            run: queuedRun,
+          };
+        }
+      }
+
       const shouldBlockImmediately =
         !recoveryAgentInvokable ||
         !recoveryAgent ||
@@ -8446,7 +8915,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           payload: withRecoveryModelProfileHint({
             issueId: issue.id,
             retryOfRunId: run.id,
-          }),
+            retry_count: retryCount,
+          }, "normal_model"),
           status: "queued",
           requestedByActorType: "system",
           requestedByActorId: null,
@@ -8471,7 +8941,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             retryReason,
             source: recoverySource,
             retryOfRunId: run.id,
-          }),
+            retry_count: retryCount,
+          }, "normal_model"),
           sessionIdBefore: recoverySessionBefore,
           retryOfRunId: run.id,
           updatedAt: now,
@@ -8510,6 +8981,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         latestRun: run,
         comment: promotionResult.comment,
       });
+      return;
+    }
+
+    if (promotionResult?.kind === "blocked_stream_disconnect") {
+      // Comment was already posted in the tx (untagged or escalation-tagged).
+      // Just mark the issue blocked without the full stranded-recovery machinery.
+      await issuesSvc.update(promotionResult.issue.id, { status: "blocked" });
       return;
     }
 
