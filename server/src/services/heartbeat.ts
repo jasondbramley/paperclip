@@ -8836,7 +8836,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
           const recoverySource =
             issue.status === "todo" ? "issue.assignment_recovery" : "issue.continuation_recovery";
-          const resetTaskKey = deriveTaskKeyWithHeartbeatFallback(run.contextSnapshot, issue.id);
+          const resetTaskKey = deriveTaskKeyWithHeartbeatFallback(run.contextSnapshot, null);
           const resetCommentTs = now.toISOString();
 
           const wakeupRequest = await tx
@@ -8911,7 +8911,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             { agentId: recoveryAgent.id, runId: queuedRun.id },
             { authorType: "agent" },
           );
-          await resetRuntimeSession(recoveryAgent.id, { taskKey: resetTaskKey }).catch(() => undefined);
+          // Session-reset occurs via the new run's sessionIdBefore: null which forces a fresh session.
 
           return {
             kind: "queued_recovery" as const,
