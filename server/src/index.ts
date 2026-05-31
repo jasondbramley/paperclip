@@ -862,6 +862,11 @@ export async function startServer(): Promise<StartedServer> {
       logger.error({ err }, "startup heartbeat recovery failed");
     });
 
+    // Guard: only one reconcile chain may run at a time. Without this, if a chain
+    // takes longer than the interval (30 s) the next tick fires another chain while
+    // the first is still holding DB connections, causing pool exhaustion → API wedge.
+    let periodicReconcileRunning = false;
+
     setInterval(() => {
       const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
       if (sweptRuntimeStatuses > 0) {
@@ -903,7 +908,14 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "environment customImage setup cleanup failed");
         });
-  
+
+      if (periodicReconcileRunning) {
+        logger.warn("periodic heartbeat reconcile skipped — previous iteration still running");
+        return;
+      }
+      periodicReconcileRunning = true;
+      const reconcileStartMs = Date.now();
+
       // Periodically reap orphaned runs (5-min staleness threshold) and make sure
       // persisted queued work is still being driven forward.
       void heartbeat
@@ -956,8 +968,17 @@ export async function startServer(): Promise<StartedServer> {
             logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
           }
         })
+        .then(() => {
+          const elapsedMs = Date.now() - reconcileStartMs;
+          if (elapsedMs > 10_000) {
+            logger.warn({ elapsedMs }, "periodic heartbeat reconcile completed slowly");
+          }
+        })
         .catch((err) => {
           logger.error({ err }, "periodic heartbeat recovery failed");
+        })
+        .finally(() => {
+          periodicReconcileRunning = false;
         });
     }, config.heartbeatSchedulerIntervalMs);
   }

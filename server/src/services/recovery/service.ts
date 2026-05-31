@@ -2857,7 +2857,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             eq(issues.status, "in_review"),
           ),
         ),
-      );
+      )
+      .orderBy(asc(issues.updatedAt))
+      .limit(500);
 
     const result = {
       assignmentDispatched: 0,
