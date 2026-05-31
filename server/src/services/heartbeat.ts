@@ -1333,10 +1333,14 @@ function didAutomaticRecoveryFail(
 
 const CONTEXT_OVERFLOW_FAILURE_PATTERN = /(context window|adapter_failed.*context|maximum context length)/i;
 const STREAM_DISCONNECT_FAILURE_PATTERN =
-  /(stream disconnected before completion|response\.failed event received|transport error:\s*timeout)/i;
+  /(stream disconnected before completion|response\.failed event received|transport error:\s*timeout|adapter_failed\s*[-–]\s*stream\s+disconnected|HTTP[/ ]\s*5\d\d)/i;
 const AUTO_RESET_WINDOW_MS = 60 * 60 * 1000;
 const AUTO_RESET_LIMIT_PER_HOUR = 2;
-const STREAM_DISCONNECT_RETRY_LIMIT = 1;
+const STREAM_DISCONNECT_RETRY_LIMIT = 2;
+const STREAM_DISCONNECT_RETRY_DELAY_MS_MIN = 10_000;
+const STREAM_DISCONNECT_RETRY_DELAY_MS_MAX = 15_000;
+const STREAM_DISCONNECT_CROSS_HEARTBEAT_WINDOW_MS = 30 * 60 * 1000;
+const STREAM_DISCONNECT_CROSS_HEARTBEAT_ESCALATION_LIMIT = 9;
 
 type AutoResetState = {
   windowStartedAt?: string;
@@ -1379,6 +1383,41 @@ function nextAutoResetState(
   const sameWindow =
     Boolean(previousWindowValid) &&
     now.getTime() - (previousWindow as Date).getTime() < AUTO_RESET_WINDOW_MS;
+  const attemptsInWindow = sameWindow ? (previous.attempts ?? 0) + 1 : 1;
+  return {
+    attemptsInWindow,
+    nextState: {
+      windowStartedAt: sameWindow ? previous.windowStartedAt : now.toISOString(),
+      attempts: attemptsInWindow,
+    },
+  };
+}
+
+type StreamDisconnectState = {
+  windowStartedAt?: string;
+  attempts?: number;
+};
+
+function readStreamDisconnectState(stateJson: Record<string, unknown> | null | undefined): StreamDisconnectState {
+  const root = parseObject(stateJson);
+  const recovery = parseObject(root.autoRecovery);
+  const sd = parseObject(recovery.streamDisconnect);
+  const windowStartedAt = readNonEmptyString(sd.windowStartedAt) ?? undefined;
+  const attempts = typeof sd.attempts === "number" && Number.isFinite(sd.attempts)
+    ? Math.max(0, Math.floor(sd.attempts))
+    : 0;
+  return { windowStartedAt, attempts };
+}
+
+function nextStreamDisconnectState(
+  previous: StreamDisconnectState,
+  now: Date,
+): { nextState: StreamDisconnectState; attemptsInWindow: number } {
+  const previousWindow = previous.windowStartedAt ? new Date(previous.windowStartedAt) : null;
+  const previousWindowValid = previousWindow && !Number.isNaN(previousWindow.getTime());
+  const sameWindow =
+    Boolean(previousWindowValid) &&
+    now.getTime() - (previousWindow as Date).getTime() < STREAM_DISCONNECT_CROSS_HEARTBEAT_WINDOW_MS;
   const attemptsInWindow = sameWindow ? (previous.attempts ?? 0) + 1 : 1;
   return {
     attemptsInWindow,
@@ -8592,79 +8631,160 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const isStreamDisconnect = matchesStreamDisconnectFailure(failureReason);
       const isContextOverflow = matchesContextOverflowFailure(failureReason);
 
-      if (isStreamDisconnect && retryCount < STREAM_DISCONNECT_RETRY_LIMIT && recoveryAgentInvokable && recoveryAgent) {
-        const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
-        const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
-        const recoverySource =
-          issue.status === "todo" ? "issue.assignment_recovery" : "issue.continuation_recovery";
+      if (isStreamDisconnect && recoveryAgentInvokable && recoveryAgent) {
         const now = new Date();
-        const wakeupRequest = await tx
-          .insert(agentWakeupRequests)
-          .values({
-            companyId: issue.companyId,
-            agentId: recoveryAgent.id,
-            source: "automation",
-            triggerDetail: "system",
-            reason: recoveryReason,
-            payload: withRecoveryModelProfileHint({
-              issueId: issue.id,
-              retryOfRunId: run.id,
-              retry_count: retryCount + 1,
-            }, "normal_model"),
-            status: "queued",
-            requestedByActorType: "system",
-            requestedByActorId: null,
-            updatedAt: now,
-          })
-          .returning()
-          .then((rows) => rows[0]);
 
-        const queuedRun = await tx
-          .insert(heartbeatRuns)
-          .values({
-            companyId: issue.companyId,
-            agentId: recoveryAgent.id,
-            invocationSource: "automation",
-            triggerDetail: "system",
-            status: "queued",
-            wakeupRequestId: wakeupRequest.id,
-            contextSnapshot: withRecoveryModelProfileHint({
-              issueId: issue.id,
-              taskId: issue.id,
-              wakeReason: recoveryReason,
-              retryReason,
-              source: recoverySource,
-              retryOfRunId: run.id,
-              retry_count: retryCount + 1,
-            }, "normal_model"),
-            sessionIdBefore: recoverySessionBefore,
-            retryOfRunId: run.id,
-            updatedAt: now,
-          })
-          .returning()
-          .then((rows) => rows[0]);
-
+        // Track cross-heartbeat stream-disconnect failures in runtime state.
+        const runtimeState = await tx
+          .select()
+          .from(agentRuntimeState)
+          .where(eq(agentRuntimeState.agentId, recoveryAgent.id))
+          .then((rows) => rows[0] ?? null);
+        const currentSdState = readStreamDisconnectState(runtimeState?.stateJson);
+        const { nextState: nextSdState, attemptsInWindow } = nextStreamDisconnectState(currentSdState, now);
+        const rootStateJson = parseObject(runtimeState?.stateJson);
+        const autoRecovery = parseObject(rootStateJson.autoRecovery);
         await tx
-          .update(agentWakeupRequests)
-          .set({
-            runId: queuedRun.id,
+          .insert(agentRuntimeState)
+          .values({
+            agentId: recoveryAgent.id,
+            companyId: recoveryAgent.companyId,
+            adapterType: recoveryAgent.adapterType,
+            stateJson: {
+              ...rootStateJson,
+              autoRecovery: {
+                ...autoRecovery,
+                streamDisconnect: nextSdState,
+              },
+            },
             updatedAt: now,
           })
-          .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+          .onConflictDoUpdate({
+            target: agentRuntimeState.agentId,
+            set: {
+              stateJson: {
+                ...rootStateJson,
+                autoRecovery: {
+                  ...autoRecovery,
+                  streamDisconnect: nextSdState,
+                },
+              },
+              updatedAt: now,
+            },
+          });
 
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: queuedRun.id,
-            executionAgentNameKey: recoveryAgentNameKey,
-            executionLockedAt: now,
-            updatedAt: now,
-          })
-          .where(eq(issues.id, issue.id));
+        // Cross-heartbeat escalation: persistent network instability detected.
+        if (attemptsInWindow >= STREAM_DISCONNECT_CROSS_HEARTBEAT_ESCALATION_LIMIT) {
+          await issuesSvc.addComment(
+            issue.id,
+            `Blocker: Jason Bramley — Persistent stream-disconnect failures: ${attemptsInWindow} failed attempts in the last 30 minutes across multiple heartbeat cycles. Network instability suspected. Manual review required before further retries.`,
+            { agentId: recoveryAgent.id, runId: run.id },
+            { authorType: "agent" },
+          );
+          return {
+            kind: "blocked_stream_disconnect" as const,
+            issue,
+            previousStatus: issue.status,
+          };
+        }
 
+        if (retryCount < STREAM_DISCONNECT_RETRY_LIMIT) {
+          // Retry with a jittered delay so the network can stabilise before re-connecting.
+          const delayMs = STREAM_DISCONNECT_RETRY_DELAY_MS_MIN +
+            Math.floor(Math.random() * (STREAM_DISCONNECT_RETRY_DELAY_MS_MAX - STREAM_DISCONNECT_RETRY_DELAY_MS_MIN));
+          const scheduledRetryAt = new Date(now.getTime() + delayMs);
+          const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
+          const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
+          const recoverySource =
+            issue.status === "todo" ? "issue.assignment_recovery" : "issue.continuation_recovery";
+
+          const wakeupRequest = await tx
+            .insert(agentWakeupRequests)
+            .values({
+              companyId: issue.companyId,
+              agentId: recoveryAgent.id,
+              source: "automation",
+              triggerDetail: "system",
+              reason: recoveryReason,
+              payload: withRecoveryModelProfileHint({
+                issueId: issue.id,
+                retryOfRunId: run.id,
+                retry_count: retryCount + 1,
+              }, "normal_model"),
+              status: "queued",
+              requestedByActorType: "system",
+              requestedByActorId: null,
+              updatedAt: now,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+
+          const scheduledRun = await tx
+            .insert(heartbeatRuns)
+            .values({
+              companyId: issue.companyId,
+              agentId: recoveryAgent.id,
+              invocationSource: "automation",
+              triggerDetail: "system",
+              status: "scheduled_retry",
+              scheduledRetryAt,
+              scheduledRetryAttempt: 1,
+              scheduledRetryReason: "stream_disconnect_retry",
+              wakeupRequestId: wakeupRequest.id,
+              contextSnapshot: withRecoveryModelProfileHint({
+                issueId: issue.id,
+                taskId: issue.id,
+                wakeReason: recoveryReason,
+                retryReason,
+                source: recoverySource,
+                retryOfRunId: run.id,
+                retry_count: retryCount + 1,
+                stream_disconnect_resume_notice:
+                  "If you are resuming after a stream-disconnect retry, do a quick state check before starting new tool work — your last attempt may have left partial side effects.",
+              }, "normal_model"),
+              sessionIdBefore: recoverySessionBefore,
+              retryOfRunId: run.id,
+              updatedAt: now,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              runId: scheduledRun.id,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+          await tx
+            .update(issues)
+            .set({
+              executionRunId: scheduledRun.id,
+              executionAgentNameKey: recoveryAgentNameKey,
+              executionLockedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(issues.id, issue.id));
+
+          return {
+            kind: "queued_recovery" as const,
+            run: scheduledRun,
+          };
+        }
+
+        // Retry limit exhausted — mark blocked with an untagged comment (no Blocker: prefix)
+        // so this network event does not mirror to staff Teams channels.
+        await issuesSvc.addComment(
+          issue.id,
+          `Stream-disconnect retry limit reached after ${STREAM_DISCONNECT_RETRY_LIMIT} attempts. Network event: ${failureReason ?? "stream disconnect"}. Moving issue to blocked pending manual review.`,
+          { agentId: recoveryAgent.id, runId: run.id },
+          { authorType: "agent" },
+        );
         return {
-          kind: "queued_recovery" as const,
-          run: queuedRun,
+          kind: "blocked_stream_disconnect" as const,
+          issue,
+          previousStatus: issue.status,
         };
       }
 
@@ -8899,6 +9019,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         latestRun: run,
         comment: promotionResult.comment,
       });
+      return;
+    }
+
+    if (promotionResult?.kind === "blocked_stream_disconnect") {
+      // Comment was already posted in the tx (untagged or escalation-tagged).
+      // Just mark the issue blocked without the full stranded-recovery machinery.
+      await issuesSvc.update(promotionResult.issue.id, { status: "blocked" });
       return;
     }
 
