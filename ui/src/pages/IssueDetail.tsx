@@ -158,7 +158,7 @@ import {
 
 type CommentReassignment = IssueCommentReassignment;
 type ActionableIssueThreadInteraction = SuggestTasksInteraction | RequestConfirmationInteraction;
-type ResolveRecoveryActionOutcome = "restored" | "false_positive" | "blocked" | "cancelled";
+type ResolveRecoveryActionOutcome = "restored" | "continued" | "false_positive" | "blocked" | "cancelled";
 type IssueDetailComment = (IssueComment | OptimisticIssueComment) & {
   runId?: string | null;
   runAgentId?: string | null;
@@ -1770,7 +1770,7 @@ export function IssueDetail() {
     mutationFn: (data: {
       actionId?: string;
       outcome: ResolveRecoveryActionOutcome;
-      sourceIssueStatus: "done" | "in_review" | "blocked";
+      sourceIssueStatus: "done" | "in_progress" | "in_review" | "blocked";
       resolutionNote?: string | null;
     }) => issuesApi.resolveRecoveryAction(issueId!, data),
     onSuccess: ({ issue: nextIssue }) => {
@@ -3000,6 +3000,9 @@ export function IssueDetail() {
       const actionId = activeRecoveryActionId;
       if (!actionId) return;
       switch (outcome) {
+        case "continued":
+          void resolveRecoveryAction.mutateAsync({ actionId, outcome: "continued", sourceIssueStatus: "in_progress" });
+          return;
         case "done":
           void resolveRecoveryAction.mutateAsync({ actionId, outcome: "restored", sourceIssueStatus: "done" });
           return;

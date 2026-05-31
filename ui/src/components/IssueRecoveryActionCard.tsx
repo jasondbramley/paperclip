@@ -25,6 +25,7 @@ export type RecoveryCardCardState = RecoveryDisplayState;
 export const deriveRecoveryCardState = deriveRecoveryDisplayState;
 
 export type RecoveryResolveOutcome =
+  | "continued"
   | "done"
   | "in_review"
   | "false_positive_done"
@@ -122,6 +123,7 @@ const STATE_TONE: Record<RecoveryCardCardState, {
 
 const OUTCOME_LABEL: Record<IssueRecoveryActionOutcome, string> = {
   restored: "restored",
+  continued: "continued",
   delegated: "delegated to follow-up",
   false_positive: "false positive",
   blocked: "blocked",
@@ -292,6 +294,11 @@ const RESOLVE_OPTIONS: Array<{
   destructive?: boolean;
   boardOnly?: boolean;
 }> = [
+  {
+    outcome: "continued",
+    label: "Keep in progress",
+    description: "Resolve recovery by recording that the issue should stay open.",
+  },
   {
     outcome: "done",
     label: "Mark issue done",
