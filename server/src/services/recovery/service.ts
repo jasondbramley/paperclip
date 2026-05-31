@@ -1982,7 +1982,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           inArray(issues.status, ["todo", "in_progress"]),
           sql`${issues.assigneeAgentId} is not null`,
         ),
-      );
+      )
+      .orderBy(asc(issues.updatedAt))
+      .limit(500);
 
     const result = {
       assignmentDispatched: 0,
