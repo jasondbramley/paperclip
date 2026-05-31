@@ -90,6 +90,10 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "opencode_local",
   "pi_local",
 ]);
+export const DEFAULT_ADAPTER_SILENT_HANG_TIMEOUT_MS = 5 * 60 * 1000;
+const ADAPTER_SILENT_HANG_RETRY_LIMIT = STREAM_DISCONNECT_RETRY_LIMIT;
+const ADAPTER_SILENT_HANG_RETRY_DELAY_MS_MIN = STREAM_DISCONNECT_RETRY_DELAY_MS_MIN;
+const ADAPTER_SILENT_HANG_RETRY_DELAY_MS_MAX = STREAM_DISCONNECT_RETRY_DELAY_MS_MAX;
 
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -504,6 +508,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         attempts: attemptsInWindow,
       },
     };
+  }
+
+  function readAdapterSilentHangTimeoutMs(): number {
+    const env = process.env.PAPERCLIP_ADAPTER_SILENT_HANG_TIMEOUT_MS;
+    if (typeof env === "string" && env.trim().length > 0) {
+      const parsed = parseInt(env.trim(), 10);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return DEFAULT_ADAPTER_SILENT_HANG_TIMEOUT_MS;
   }
 
   async function getLatestIssueRun(companyId: string, issueId: string): Promise<LatestIssueRun> {
@@ -1620,6 +1633,299 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
     return { kind: "created" as const, evaluationIssueId: evaluation.id };
+  }
+
+  async function cancelSilentHangRun(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    runningAgent: typeof agents.$inferSelect;
+    now: Date;
+  }) {
+    const running = runningProcesses.get(input.run.id);
+    const pid = running?.child.pid ?? input.run.processPid ?? null;
+    const processGroupId = running?.processGroupId ?? input.run.processGroupId ?? null;
+
+    if ((typeof pid === "number" || typeof processGroupId === "number") && SESSIONED_LOCAL_ADAPTERS.has(input.runningAgent.adapterType)) {
+      try {
+        await terminateLocalService(
+          {
+            pid: typeof pid === "number" && Number.isInteger(pid) && pid > 0 ? pid : (processGroupId ?? 0),
+            processGroupId: typeof processGroupId === "number" && Number.isInteger(processGroupId) && processGroupId > 0 ? processGroupId : null,
+          },
+          running ? { forceAfterMs: Math.max(1, running.graceSec) * 1000 } : undefined,
+        );
+      } catch (err) {
+        logger.warn({ err, runId: input.run.id }, "silent-hang watchdog: process termination error");
+      }
+      runningProcesses.delete(input.run.id);
+    }
+
+    const cancelled = await db.transaction(async (tx) => {
+      const [updatedRun] = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "cancelled",
+          finishedAt: input.now,
+          error: "Cancelled by silent-hang watchdog: no meaningful events within timeout",
+          errorCode: "adapter_silent_hang",
+          updatedAt: input.now,
+        })
+        .where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.status, "running")))
+        .returning();
+      if (!updatedRun) return null;
+
+      if (input.run.wakeupRequestId) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({ status: "cancelled", finishedAt: input.now, error: "Cancelled by silent-hang watchdog", updatedAt: input.now })
+          .where(and(eq(agentWakeupRequests.id, input.run.wakeupRequestId)));
+      }
+
+      const issueId = issueIdFromRunContext(input.run.contextSnapshot);
+      if (issueId) {
+        await tx
+          .update(issues)
+          .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null, updatedAt: input.now })
+          .where(
+            and(
+              eq(issues.id, issueId),
+              eq(issues.companyId, input.run.companyId),
+              eq(issues.executionRunId, input.run.id),
+            ),
+          );
+      }
+
+      return updatedRun;
+    });
+
+    if (!cancelled) return null;
+
+    await db
+      .insert(heartbeatRunEvents)
+      .values({
+        companyId: input.run.companyId,
+        runId: input.run.id,
+        agentId: input.run.agentId,
+        seq: await nextRunEventSeq(input.run.id),
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "run cancelled by silent-hang watchdog",
+      });
+
+    await db
+      .update(agents)
+      .set({ status: "idle", lastHeartbeatAt: input.now, updatedAt: input.now })
+      .where(and(eq(agents.id, input.run.agentId), notInArray(agents.status, ["paused", "terminated"])));
+
+    return cancelled;
+  }
+
+  async function scanAdapterSilentHangs(opts?: { now?: Date; companyId?: string }) {
+    const now = opts?.now ?? new Date();
+    const hangTimeoutMs = readAdapterSilentHangTimeoutMs();
+    const hangBefore = new Date(now.getTime() - hangTimeoutMs);
+
+    const candidates = await db
+      .select({ run: heartbeatRuns, agent: agents })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(
+        and(
+          opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
+          eq(heartbeatRuns.status, "running"),
+          sql`coalesce(${heartbeatRuns.processStartedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) <= ${hangBefore.toISOString()}::timestamptz`,
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.createdAt))
+      .limit(50);
+
+    const result = {
+      scanned: candidates.length,
+      hangDetected: 0,
+      retryScheduled: 0,
+      escalated: 0,
+      skipped: 0,
+      runIds: [] as string[],
+    };
+
+    for (const { run, agent } of candidates) {
+      if (!SESSIONED_LOCAL_ADAPTERS.has(agent.adapterType)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const [eventStats] = await db
+        .select({
+          meaningfulCount: sql<number>`count(*) filter (where ${heartbeatRunEvents.eventType} not in ('lifecycle', 'adapter.invoke', 'error'))::int`,
+        })
+        .from(heartbeatRunEvents)
+        .where(and(eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id)));
+
+      if ((eventStats?.meaningfulCount ?? 0) > 0) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const cancelled = await cancelSilentHangRun({ run, runningAgent: agent, now });
+      if (!cancelled) {
+        result.skipped += 1;
+        continue;
+      }
+
+      result.hangDetected += 1;
+      result.runIds.push(run.id);
+
+      const issueId = issueIdFromRunContext(run.contextSnapshot);
+      if (!issueId) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const [issue] = await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId), isNull(issues.hiddenAt)))
+        .limit(1);
+      if (!issue || !["todo", "in_progress"].includes(issue.status)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const runtimeStateRow = await db
+        .select()
+        .from(agentRuntimeState)
+        .where(eq(agentRuntimeState.agentId, run.agentId))
+        .then((rows) => rows[0] ?? null);
+      const currentSdState = readStreamDisconnectState(runtimeStateRow?.stateJson);
+      const { nextState: nextSdState, attemptsInWindow } = nextStreamDisconnectState(currentSdState, now);
+      const rootState = parseObject(runtimeStateRow?.stateJson);
+      const autoRecovery = parseObject(rootState.autoRecovery);
+      await db
+        .insert(agentRuntimeState)
+        .values({
+          agentId: run.agentId,
+          companyId: run.companyId,
+          adapterType: agent.adapterType,
+          stateJson: { ...rootState, autoRecovery: { ...autoRecovery, streamDisconnect: nextSdState } },
+          updatedAt: now,
+        })
+        .onConflictDoUpdate({
+          target: agentRuntimeState.agentId,
+          set: {
+            stateJson: { ...rootState, autoRecovery: { ...autoRecovery, streamDisconnect: nextSdState } },
+            updatedAt: now,
+          },
+        });
+
+      if (attemptsInWindow >= STREAM_DISCONNECT_CROSS_HEARTBEAT_ESCALATION_LIMIT) {
+        await issuesSvc.addComment(
+          issue.id,
+          `Blocker: Jason Bramley — Persistent adapter failures: ${attemptsInWindow} silent hangs or stream disconnects in the last 30 minutes. Possible model/network instability. Manual review required before further retries.`,
+          { agentId: run.agentId },
+          { authorType: "agent" },
+        );
+        await issuesSvc.update(issue.id, { status: "blocked" });
+        result.escalated += 1;
+        continue;
+      }
+
+      const retryCount = readRecoveryRetryCount(run.contextSnapshot);
+      if (retryCount >= ADAPTER_SILENT_HANG_RETRY_LIMIT) {
+        await issuesSvc.addComment(
+          issue.id,
+          `Silent-hang retry limit reached after ${ADAPTER_SILENT_HANG_RETRY_LIMIT} attempts. Adapter invoked but emitted no meaningful events within ${Math.round(hangTimeoutMs / 60_000)} min. Moving issue to blocked pending manual review.`,
+          { agentId: run.agentId },
+          { authorType: "agent" },
+        );
+        await issuesSvc.update(issue.id, { status: "blocked" });
+        result.escalated += 1;
+        continue;
+      }
+
+      if (await isInvocationBudgetBlocked(issue, run.agentId)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const delayMs = ADAPTER_SILENT_HANG_RETRY_DELAY_MS_MIN +
+        Math.floor(Math.random() * (ADAPTER_SILENT_HANG_RETRY_DELAY_MS_MAX - ADAPTER_SILENT_HANG_RETRY_DELAY_MS_MIN));
+      const scheduledRetryAt = new Date(now.getTime() + delayMs);
+      const sessionId = readNonEmptyString(run.sessionIdBefore) ?? readNonEmptyString(run.sessionIdAfter) ?? null;
+
+      const wakeupRequest = await db
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: issue.companyId,
+          agentId: run.agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_continuation_needed",
+          payload: withRecoveryModelProfileHint({
+            issueId: issue.id,
+            retryOfRunId: run.id,
+          }, "normal_model"),
+          status: "queued",
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      const scheduledRun = wakeupRequest
+        ? await db
+          .insert(heartbeatRuns)
+          .values({
+            companyId: issue.companyId,
+            agentId: run.agentId,
+            invocationSource: "automation",
+            triggerDetail: "system",
+            status: "scheduled_retry",
+            scheduledRetryAt,
+            scheduledRetryAttempt: 1,
+            scheduledRetryReason: "silent_hang_retry",
+            wakeupRequestId: wakeupRequest.id,
+            contextSnapshot: withRecoveryModelProfileHint({
+              issueId: issue.id,
+              taskId: issue.id,
+              wakeReason: "issue_continuation_needed",
+              retryReason: "issue_continuation_needed",
+              source: "issue.continuation_recovery",
+              retryOfRunId: run.id,
+              retry_count: retryCount + 1,
+              ...(sessionId ? { sessionId } : {}),
+              silent_hang_resume_notice:
+                "Resuming after silent-hang watchdog cancellation. Do a quick state check before starting new tool work — the previous run may have started work without recording it.",
+            }, "normal_model"),
+            sessionIdBefore: sessionId,
+            retryOfRunId: run.id,
+            updatedAt: now,
+          })
+          .returning()
+          .then((rows) => rows[0] ?? null)
+        : null;
+
+      if (wakeupRequest && scheduledRun) {
+        await db
+          .update(agentWakeupRequests)
+          .set({ runId: scheduledRun.id, updatedAt: now })
+          .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+        await db
+          .update(issues)
+          .set({ executionRunId: scheduledRun.id, updatedAt: now })
+          .where(eq(issues.id, issue.id));
+        result.retryScheduled += 1;
+      } else {
+        result.skipped += 1;
+      }
+    }
+
+    return result;
   }
 
   async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string }) {
@@ -3782,6 +4088,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     escalateStrandedRecoveryIssueInPlace,
     escalateStrandedAssignedIssue,
     recordWatchdogDecision,
+    scanAdapterSilentHangs,
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
     buildIssueGraphLivenessAutoRecoveryPreview,
