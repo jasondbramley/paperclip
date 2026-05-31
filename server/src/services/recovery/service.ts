@@ -9,6 +9,7 @@ import {
 } from "@paperclipai/shared";
 import {
   agents,
+  agentRuntimeState,
   agentWakeupRequests,
   approvals,
   activityLog,
@@ -63,6 +64,12 @@ import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js"
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+const CONTEXT_OVERFLOW_FAILURE_PATTERN = /(context window|adapter_failed.*context|maximum context length)/i;
+const STREAM_DISCONNECT_FAILURE_PATTERN =
+  /(stream disconnected before completion|response\.failed event received|transport error:\s*timeout)/i;
+const AUTO_RESET_WINDOW_MS = 60 * 60 * 1000;
+const AUTO_RESET_LIMIT_PER_HOUR = 2;
+const STREAM_DISCONNECT_RETRY_LIMIT = 1;
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
@@ -415,6 +422,47 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
   }
 
+  function readNonEmptyString(value: unknown): string | null {
+    return typeof value === "string" && value.length > 0 ? value : null;
+  }
+
+  function matchesStreamDisconnectFailure(reason: string | null | undefined) {
+    return Boolean(reason && STREAM_DISCONNECT_FAILURE_PATTERN.test(reason));
+  }
+
+  function matchesContextOverflowFailure(reason: string | null | undefined) {
+    return Boolean(reason && CONTEXT_OVERFLOW_FAILURE_PATTERN.test(reason));
+  }
+
+  function readRecoveryRetryCount(contextSnapshot: unknown) {
+    const context = parseObject(contextSnapshot);
+    const raw = context.retry_count;
+    return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 0;
+  }
+
+  function readAutoResetState(stateJson: Record<string, unknown> | null | undefined) {
+    const root = parseObject(stateJson);
+    const recovery = parseObject(root.autoRecovery);
+    const contextOverflow = parseObject(recovery.contextOverflow);
+    const windowStartedAt = readNonEmptyString(contextOverflow.windowStartedAt) ?? undefined;
+    const attempts =
+      typeof contextOverflow.attempts === "number" && Number.isFinite(contextOverflow.attempts)
+        ? Math.max(0, Math.floor(contextOverflow.attempts))
+        : 0;
+    return { windowStartedAt, attempts };
+  }
+
+  function nextAutoResetState(current: { windowStartedAt?: string; attempts?: number }, now: Date) {
+    const windowStartedAt = current.windowStartedAt ? new Date(current.windowStartedAt) : null;
+    const inWindow = windowStartedAt && now.getTime() - windowStartedAt.getTime() < AUTO_RESET_WINDOW_MS;
+    const attemptsInWindow = inWindow ? (current.attempts ?? 0) + 1 : 1;
+    const nextState = {
+      windowStartedAt: inWindow ? current.windowStartedAt! : now.toISOString(),
+      attempts: attemptsInWindow,
+    };
+    return { nextState, attemptsInWindow };
+  }
+
   async function getLatestIssueRun(companyId: string, issueId: string): Promise<LatestIssueRun> {
     return db
       .select({
@@ -491,6 +539,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     retryReason: "assignment_recovery" | "issue_continuation_needed";
     source: string;
     retryOfRunId?: string | null;
+    extraContext?: Record<string, unknown>;
   }) {
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
@@ -509,6 +558,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         retryReason: input.retryReason,
         source: input.source,
         ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
+        ...(input.extraContext ?? {}),
       }, "normal_model"),
     });
 
@@ -2545,6 +2595,104 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
         continue;
       }
+      const failureReason = readNonEmptyString(latestRun?.error ?? null);
+      const retryCount = readRecoveryRetryCount(latestRun?.contextSnapshot);
+      const isStreamDisconnect = matchesStreamDisconnectFailure(failureReason);
+      const isContextOverflow = matchesContextOverflowFailure(failureReason);
+
+      if (isStreamDisconnect && retryCount < STREAM_DISCONNECT_RETRY_LIMIT) {
+        if (await isInvocationBudgetBlocked(issue, agentId)) {
+          result.skipped += 1;
+          continue;
+        }
+        const queued = await enqueueStrandedIssueRecovery({
+          issueId: issue.id,
+          agentId,
+          reason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+          source: "issue.continuation_recovery",
+          retryOfRunId: latestRun?.id ?? null,
+          extraContext: { retry_count: retryCount + 1 },
+        });
+        if (queued) {
+          result.continuationRequeued += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+
+      if (isContextOverflow) {
+        const runtimeStateRow = await db
+          .select()
+          .from(agentRuntimeState)
+          .where(eq(agentRuntimeState.agentId, agentId))
+          .then((rows) => rows[0] ?? null);
+        const now = new Date();
+        const currentResetState = readAutoResetState(runtimeStateRow?.stateJson);
+        const { nextState, attemptsInWindow } = nextAutoResetState(currentResetState, now);
+
+        if (attemptsInWindow <= AUTO_RESET_LIMIT_PER_HOUR) {
+          const rootState = parseObject(runtimeStateRow?.stateJson);
+          const autoRecovery = parseObject(rootState.autoRecovery);
+          await db
+            .insert(agentRuntimeState)
+            .values({
+              agentId,
+              companyId: issue.companyId,
+              adapterType: (await getAgent(agentId))?.adapterType ?? "codex_local",
+              sessionId: null,
+              lastError: null,
+              stateJson: {
+                ...rootState,
+                autoRecovery: { ...autoRecovery, contextOverflow: nextState },
+              },
+              updatedAt: now,
+            })
+            .onConflictDoUpdate({
+              target: agentRuntimeState.agentId,
+              set: {
+                sessionId: null,
+                lastError: null,
+                stateJson: {
+                  ...rootState,
+                  autoRecovery: { ...autoRecovery, contextOverflow: nextState },
+                },
+                updatedAt: now,
+              },
+            });
+
+          const resetCommentTs = now.toISOString();
+          if (await isInvocationBudgetBlocked(issue, agentId)) {
+            result.skipped += 1;
+            continue;
+          }
+          const queued = await enqueueStrandedIssueRecovery({
+            issueId: issue.id,
+            agentId,
+            reason: "issue_continuation_needed",
+            retryReason: "issue_continuation_needed",
+            source: "issue.continuation_recovery",
+            retryOfRunId: latestRun?.id ?? null,
+            extraContext: { retry_count: 0, auto_reset_after_context_overflow: true },
+          });
+          if (queued) {
+            await issuesSvc.addComment(
+              issue.id,
+              `Auto-reset session after context overflow at ${resetCommentTs}. Retry in progress.`,
+              { agentId, runId: queued.id },
+              { authorType: "agent" },
+            );
+            result.continuationRequeued += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+      }
+
       if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
         const failureSummary = summarizeRunFailureForIssueComment(latestRun);
         const updated = await escalateStrandedAssignedIssue({

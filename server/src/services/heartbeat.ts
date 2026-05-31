@@ -1331,6 +1331,64 @@ function didAutomaticRecoveryFail(
   );
 }
 
+const CONTEXT_OVERFLOW_FAILURE_PATTERN = /(context window|adapter_failed.*context|maximum context length)/i;
+const STREAM_DISCONNECT_FAILURE_PATTERN =
+  /(stream disconnected before completion|response\.failed event received|transport error:\s*timeout)/i;
+const AUTO_RESET_WINDOW_MS = 60 * 60 * 1000;
+const AUTO_RESET_LIMIT_PER_HOUR = 2;
+const STREAM_DISCONNECT_RETRY_LIMIT = 1;
+
+type AutoResetState = {
+  windowStartedAt?: string;
+  attempts?: number;
+};
+
+function matchesContextOverflowFailure(reason: string | null | undefined) {
+  return Boolean(reason && CONTEXT_OVERFLOW_FAILURE_PATTERN.test(reason));
+}
+
+function matchesStreamDisconnectFailure(reason: string | null | undefined) {
+  return Boolean(reason && STREAM_DISCONNECT_FAILURE_PATTERN.test(reason));
+}
+
+function readRecoveryRetryCount(contextSnapshot: unknown) {
+  const context = parseObject(contextSnapshot);
+  const raw = context.retry_count;
+  return typeof raw === "number" && Number.isFinite(raw) && raw >= 0
+    ? Math.floor(raw)
+    : 0;
+}
+
+function readAutoResetState(stateJson: Record<string, unknown> | null | undefined): AutoResetState {
+  const root = parseObject(stateJson);
+  const recovery = parseObject(root.autoRecovery);
+  const contextOverflow = parseObject(recovery.contextOverflow);
+  const windowStartedAt = readNonEmptyString(contextOverflow.windowStartedAt) ?? undefined;
+  const attempts = typeof contextOverflow.attempts === "number" && Number.isFinite(contextOverflow.attempts)
+    ? Math.max(0, Math.floor(contextOverflow.attempts))
+    : 0;
+  return { windowStartedAt, attempts };
+}
+
+function nextAutoResetState(
+  previous: AutoResetState,
+  now: Date,
+): { nextState: AutoResetState; attemptsInWindow: number } {
+  const previousWindow = previous.windowStartedAt ? new Date(previous.windowStartedAt) : null;
+  const previousWindowValid = previousWindow && !Number.isNaN(previousWindow.getTime());
+  const sameWindow =
+    Boolean(previousWindowValid) &&
+    now.getTime() - (previousWindow as Date).getTime() < AUTO_RESET_WINDOW_MS;
+  const attemptsInWindow = sameWindow ? (previous.attempts ?? 0) + 1 : 1;
+  return {
+    attemptsInWindow,
+    nextState: {
+      windowStartedAt: sameWindow ? previous.windowStartedAt : now.toISOString(),
+      attempts: attemptsInWindow,
+    },
+  };
+}
+
 function normalizeLedgerBillingType(value: unknown): BillingType {
   const raw = readNonEmptyString(value);
   switch (raw) {
@@ -8529,6 +8587,219 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
+      const failureReason = readNonEmptyString(run.error);
+      const retryCount = readRecoveryRetryCount(run.contextSnapshot);
+      const isStreamDisconnect = matchesStreamDisconnectFailure(failureReason);
+      const isContextOverflow = matchesContextOverflowFailure(failureReason);
+
+      if (isStreamDisconnect && retryCount < STREAM_DISCONNECT_RETRY_LIMIT && recoveryAgentInvokable && recoveryAgent) {
+        const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
+        const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
+        const recoverySource =
+          issue.status === "todo" ? "issue.assignment_recovery" : "issue.continuation_recovery";
+        const now = new Date();
+        const wakeupRequest = await tx
+          .insert(agentWakeupRequests)
+          .values({
+            companyId: issue.companyId,
+            agentId: recoveryAgent.id,
+            source: "automation",
+            triggerDetail: "system",
+            reason: recoveryReason,
+            payload: withRecoveryModelProfileHint({
+              issueId: issue.id,
+              retryOfRunId: run.id,
+              retry_count: retryCount + 1,
+            }, "normal_model"),
+            status: "queued",
+            requestedByActorType: "system",
+            requestedByActorId: null,
+            updatedAt: now,
+          })
+          .returning()
+          .then((rows) => rows[0]);
+
+        const queuedRun = await tx
+          .insert(heartbeatRuns)
+          .values({
+            companyId: issue.companyId,
+            agentId: recoveryAgent.id,
+            invocationSource: "automation",
+            triggerDetail: "system",
+            status: "queued",
+            wakeupRequestId: wakeupRequest.id,
+            contextSnapshot: withRecoveryModelProfileHint({
+              issueId: issue.id,
+              taskId: issue.id,
+              wakeReason: recoveryReason,
+              retryReason,
+              source: recoverySource,
+              retryOfRunId: run.id,
+              retry_count: retryCount + 1,
+            }, "normal_model"),
+            sessionIdBefore: recoverySessionBefore,
+            retryOfRunId: run.id,
+            updatedAt: now,
+          })
+          .returning()
+          .then((rows) => rows[0]);
+
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            runId: queuedRun.id,
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: queuedRun.id,
+            executionAgentNameKey: recoveryAgentNameKey,
+            executionLockedAt: now,
+            updatedAt: now,
+          })
+          .where(eq(issues.id, issue.id));
+
+        return {
+          kind: "queued_recovery" as const,
+          run: queuedRun,
+        };
+      }
+
+      if (isContextOverflow && recoveryAgentInvokable && recoveryAgent) {
+        const runtimeState = await tx
+          .select()
+          .from(agentRuntimeState)
+          .where(eq(agentRuntimeState.agentId, recoveryAgent.id))
+          .then((rows) => rows[0] ?? null);
+        const now = new Date();
+        const currentResetState = readAutoResetState(runtimeState?.stateJson);
+        const { nextState, attemptsInWindow } = nextAutoResetState(currentResetState, now);
+
+        if (attemptsInWindow <= AUTO_RESET_LIMIT_PER_HOUR) {
+          const rootState = parseObject(runtimeState?.stateJson);
+          const autoRecovery = parseObject(rootState.autoRecovery);
+          await tx
+            .insert(agentRuntimeState)
+            .values({
+              agentId: recoveryAgent.id,
+              companyId: recoveryAgent.companyId,
+              adapterType: recoveryAgent.adapterType,
+              stateJson: {
+                ...rootState,
+                autoRecovery: {
+                  ...autoRecovery,
+                  contextOverflow: nextState,
+                },
+              },
+              updatedAt: now,
+            })
+            .onConflictDoUpdate({
+              target: agentRuntimeState.agentId,
+              set: {
+                companyId: recoveryAgent.companyId,
+                adapterType: recoveryAgent.adapterType,
+                stateJson: {
+                  ...rootState,
+                  autoRecovery: {
+                    ...autoRecovery,
+                    contextOverflow: nextState,
+                  },
+                },
+                updatedAt: now,
+              },
+            });
+
+          const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
+          const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
+          const recoverySource =
+            issue.status === "todo" ? "issue.assignment_recovery" : "issue.continuation_recovery";
+          const resetTaskKey = deriveTaskKeyWithHeartbeatFallback(run.contextSnapshot, issue.id);
+          const resetCommentTs = now.toISOString();
+
+          const wakeupRequest = await tx
+            .insert(agentWakeupRequests)
+            .values({
+              companyId: issue.companyId,
+              agentId: recoveryAgent.id,
+              source: "automation",
+              triggerDetail: "system",
+              reason: recoveryReason,
+              payload: withRecoveryModelProfileHint({
+                issueId: issue.id,
+                retryOfRunId: run.id,
+                retry_count: 0,
+                auto_reset_after_context_overflow: true,
+              }, "normal_model"),
+              status: "queued",
+              requestedByActorType: "system",
+              requestedByActorId: null,
+              updatedAt: now,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+
+          const queuedRun = await tx
+            .insert(heartbeatRuns)
+            .values({
+              companyId: issue.companyId,
+              agentId: recoveryAgent.id,
+              invocationSource: "automation",
+              triggerDetail: "system",
+              status: "queued",
+              wakeupRequestId: wakeupRequest.id,
+              contextSnapshot: withRecoveryModelProfileHint({
+                issueId: issue.id,
+                taskId: issue.id,
+                wakeReason: recoveryReason,
+                retryReason,
+                source: recoverySource,
+                retryOfRunId: run.id,
+                retry_count: 0,
+                auto_reset_after_context_overflow: true,
+              }, "normal_model"),
+              sessionIdBefore: null,
+              retryOfRunId: run.id,
+              updatedAt: now,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              runId: queuedRun.id,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+          await tx
+            .update(issues)
+            .set({
+              executionRunId: queuedRun.id,
+              executionAgentNameKey: recoveryAgentNameKey,
+              executionLockedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(issues.id, issue.id));
+
+          await issuesSvc.addComment(
+            issue.id,
+            `Auto-reset session after context overflow at ${resetCommentTs}. Retry in progress.`,
+            { agentId: recoveryAgent.id, runId: queuedRun.id },
+            { authorType: "agent" },
+          );
+          await resetRuntimeSession(recoveryAgent.id, { taskKey: resetTaskKey }).catch(() => undefined);
+
+          return {
+            kind: "queued_recovery" as const,
+            run: queuedRun,
+          };
+        }
+      }
+
       const shouldBlockImmediately =
         !recoveryAgentInvokable ||
         !recoveryAgent ||
@@ -8562,6 +8833,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           payload: withRecoveryModelProfileHint({
             issueId: issue.id,
             retryOfRunId: run.id,
+            retry_count: retryCount,
           }, "normal_model"),
           status: "queued",
           requestedByActorType: "system",
@@ -8587,6 +8859,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             retryReason,
             source: recoverySource,
             retryOfRunId: run.id,
+            retry_count: retryCount,
           }, "normal_model"),
           sessionIdBefore: recoverySessionBefore,
           retryOfRunId: run.id,

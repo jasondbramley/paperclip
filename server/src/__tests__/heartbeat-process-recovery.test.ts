@@ -1286,6 +1286,54 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments).toHaveLength(0);
   });
 
+  it("cancels continuation re-wakes when the continuation summary parks a live monitor awaiting review", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const continuationDocId = randomUUID();
+    const continuationRevId = randomUUID();
+    await db.insert(documents).values({
+      id: continuationDocId,
+      companyId,
+      title: "Continuation Summary",
+      format: "markdown",
+      latestBody: "# Continuation Summary\n\n## Next Action\n\n- Wait for reviewer approval before continuing executor work.",
+      latestRevisionId: continuationRevId,
+      latestRevisionNumber: 1,
+    });
+    await db.insert(issueDocuments).values({
+      companyId,
+      issueId,
+      documentId: continuationDocId,
+      key: "continuation-summary",
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_continuation_waiting_on_review");
+    expect(run?.error).toContain("continuation summary says the executor should wait");
+
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]?.status).toBe("skipped");
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+  });
+
   it("queues one finish-handoff wake when a successful run leaves in-progress work without a next action", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     mockAdapterExecute.mockImplementationOnce(async (ctx: { runId: string }) => {
@@ -2475,6 +2523,149 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakes.some((row) => row.reason === "run_liveness_continuation")).toBe(false);
   });
+
+  it("queues one same-session retry for stranded stream-disconnect failures", async () => {
+    const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runError: "stream disconnected before completion: response.failed event received",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(2);
+
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(["queued", "running"]).toContain(retryRun?.status);
+    expect(retryRun?.retryOfRunId).toBe(runId);
+    expect(retryRun?.sessionIdBefore).toBeNull();
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      retryReason: "issue_continuation_needed",
+      retry_count: 1,
+    });
+    expect((retryRun?.contextSnapshot as Record<string, unknown>)?.auto_reset_after_context_overflow).toBeUndefined();
+    if (retryRun?.id) {
+      await waitForRunToSettle(heartbeat, retryRun.id);
+    }
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+  });
+
+  it("treats transport timeouts as stranded stream-disconnect failures", async () => {
+    const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runError: "stream disconnected before completion: Transport error: timeout",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(2);
+
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(["queued", "running"]).toContain(retryRun?.status);
+    expect(retryRun?.retryOfRunId).toBe(runId);
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      retryReason: "issue_continuation_needed",
+      retry_count: 1,
+    });
+  });
+
+  it("auto-resets session and retries stranded context-overflow failures twice per hour", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runError: "adapter_failed: maximum context length exceeded for this model",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const recentWindowStart = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    await db.insert(agentRuntimeState).values({
+      agentId,
+      companyId,
+      adapterType: "codex_local",
+      sessionId: "sess_123",
+      stateJson: {
+        autoRecovery: {
+          contextOverflow: {
+            windowStartedAt: recentWindowStart,
+            attempts: 1,
+          },
+        },
+      },
+      updatedAt: new Date(recentWindowStart),
+    });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(2);
+
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(["queued", "running"]).toContain(retryRun?.status);
+    expect(retryRun?.retryOfRunId).toBe(runId);
+    expect(retryRun?.sessionIdBefore).toBeNull();
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      retryReason: "issue_continuation_needed",
+      retry_count: 0,
+      auto_reset_after_context_overflow: true,
+    });
+
+    const runtimeState = await db
+      .select()
+      .from(agentRuntimeState)
+      .where(eq(agentRuntimeState.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(runtimeState?.sessionId).toBeNull();
+    expect(runtimeState?.lastError).toBeNull();
+    expect(runtimeState?.stateJson).toMatchObject({
+      autoRecovery: {
+        contextOverflow: {
+          attempts: 2,
+        },
+      },
+    });
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Auto-reset session after context overflow");
+    expect(comments[0]?.body).toContain("Retry in progress.");
+  });
+
   it("blocks stranded in-progress work after the continuation retry was already used", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
