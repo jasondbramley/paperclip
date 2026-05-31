@@ -212,6 +212,7 @@ export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
+  DEFAULT_ADAPTER_SILENT_HANG_TIMEOUT_MS,
 } from "./recovery/service.js";
 export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
@@ -6778,6 +6779,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       readNonEmptyString(nestedContext.taskId);
   }
 
+  async function scanAdapterSilentHangs(opts?: { now?: Date; companyId?: string }) {
+    return recovery.scanAdapterSilentHangs(opts);
+  }
+
   async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string }) {
     return recovery.scanSilentActiveRuns(opts);
   }
@@ -10225,6 +10230,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     buildIssueGraphLivenessAutoRecoveryPreview,
 
     reconcileIssueGraphLiveness,
+
+    scanAdapterSilentHangs,
 
     scanSilentActiveRuns,
 
