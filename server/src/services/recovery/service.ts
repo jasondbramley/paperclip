@@ -109,7 +109,7 @@ type RecoveryWakeup = (
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
-  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState"
+  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState" | "createdAt"
 > | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
@@ -323,6 +323,19 @@ function isRepeatedProductiveContinuationRecovery(latestRun: SuccessfulLatestIss
     isProductiveContinuationRun(latestRun);
 }
 
+function isPinnedLiveChatAnchorIssue(issue: Pick<typeof issues.$inferSelect, "title" | "description">) {
+  const title = issue.title.trim().toLowerCase();
+  const text = `${title}\n${issue.description ?? ""}`.toLowerCase();
+  const explicitlyPinned = title.startsWith("[pin open]") || /\bpin(?:ned)?\s+open\b/.test(text);
+  if (!explicitlyPinned) return false;
+  return (
+    /\bchat\s+mirror\b/.test(text) ||
+    /\bchat\s+anchor\b/.test(text) ||
+    /\blive\s+teams\s+chat\b/.test(text) ||
+    /\btickets\s+only\b/.test(text)
+  );
+}
+
 function parseLivenessIncidentKey(incidentKey: string | null | undefined) {
   if (!incidentKey) return null;
   return parseIssueGraphLivenessIncidentKey(incidentKey);
@@ -503,6 +516,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         errorCode: heartbeatRuns.errorCode,
         contextSnapshot: heartbeatRuns.contextSnapshot,
         livenessState: heartbeatRuns.livenessState,
+        createdAt: heartbeatRuns.createdAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -514,6 +528,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function hasIssueCommentAfterRun(issueId: string, run: LatestIssueRun) {
+    if (!run?.createdAt) return false;
+    const row = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(eq(issueComments.issueId, issueId), gt(issueComments.createdAt, run.createdAt)))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return Boolean(row);
   }
 
   async function hasActiveExecutionPath(companyId: string, issueId: string) {
@@ -2555,6 +2580,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.skipped += 1;
         continue;
       }
+
+      if (isPinnedLiveChatAnchorIssue(issue)) {
+        if (latestRun?.status === "succeeded") {
+          result.successfulContinuationObserved += 1;
+          result.skipped += 1;
+          continue;
+        }
+        if (latestRun && await hasIssueCommentAfterRun(issue.id, latestRun)) {
+          result.skipped += 1;
+          continue;
+        }
+      }
+
       const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
       if (handoffEvidence) {
         if (!handoffEvidence.exhausted) {
