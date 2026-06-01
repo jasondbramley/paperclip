@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { REDACTED_EVENT_VALUE, redactEventPayload, redactSensitiveText, sanitizeRecord } from "../redaction.js";
+import {
+  REDACTED_EVENT_VALUE,
+  redactAdapterConfigForResponse,
+  redactEventPayload,
+  redactSensitiveText,
+  sanitizeRecord,
+} from "../redaction.js";
 
 describe("redaction", () => {
   it("redacts sensitive keys and nested secret values", () => {
@@ -61,6 +67,36 @@ describe("redaction", () => {
     expect(redactEventPayload({ password: "hunter2", safe: "value" })).toEqual({
       password: REDACTED_EVENT_VALUE,
       safe: "value",
+    });
+  });
+
+  it("redacts all adapter env plain values for API responses", () => {
+    const result = redactAdapterConfigForResponse({
+      model: "gpt-5.5",
+      env: {
+        SAFE_LABEL: { type: "plain", value: "still-not-for-api-response" },
+        OPENAI_API_KEY: { type: "plain", value: "sk-live" },
+        GRAPH_SECRET: {
+          type: "secret_ref",
+          secretId: "11111111-1111-4111-8111-111111111111",
+          version: "latest",
+        },
+        LEGACY_RAW_VALUE: "legacy-secret",
+      },
+    });
+
+    expect(result).toEqual({
+      model: "gpt-5.5",
+      env: {
+        SAFE_LABEL: { type: "plain", value: REDACTED_EVENT_VALUE },
+        OPENAI_API_KEY: { type: "plain", value: REDACTED_EVENT_VALUE },
+        GRAPH_SECRET: {
+          type: "secret_ref",
+          secretId: "11111111-1111-4111-8111-111111111111",
+          version: "latest",
+        },
+        LEGACY_RAW_VALUE: REDACTED_EVENT_VALUE,
+      },
     });
   });
 
