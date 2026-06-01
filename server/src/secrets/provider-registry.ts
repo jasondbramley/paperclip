@@ -1,5 +1,6 @@
 import type { SecretProvider, SecretProviderDescriptor } from "@paperclipai/shared";
 import { awsSecretsManagerProvider } from "./aws-secrets-manager-provider.js";
+import { azureKeyVaultProvider } from "./azure-keyvault-provider.js";
 import { localEncryptedProvider } from "./local-encrypted-provider.js";
 import {
   gcpSecretManagerProvider,
@@ -11,6 +12,7 @@ import { unprocessable } from "../errors.js";
 const providers: SecretProviderModule[] = [
   localEncryptedProvider,
   awsSecretsManagerProvider,
+  azureKeyVaultProvider,
   gcpSecretManagerProvider,
   vaultProvider,
 ];
