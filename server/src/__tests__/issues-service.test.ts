@@ -3525,6 +3525,64 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     ]);
   });
 
+  it("top-level QA review child creation can block and wake the parent", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const parentIssueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "Coding Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      title: "Implementation waiting for QA",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId,
+    });
+
+    const child = await svc.create(companyId, {
+      parentId: parentIssueId,
+      title: "QA review: WINSOR-Memory PR #147 (SDL Hermes poller)",
+      description: "Review checklist for the implementation parent.",
+      status: "todo",
+      priority: "medium",
+      blockParentUntilDone: true,
+    });
+
+    const parentRelations = await svc.getRelationSummaries(parentIssueId);
+    expect(parentRelations.blockedBy).toEqual([
+      expect.objectContaining({
+        id: child.id,
+        title: "QA review: WINSOR-Memory PR #147 (SDL Hermes poller)",
+      }),
+    ]);
+
+    await svc.update(child.id, { status: "done" });
+
+    await expect(svc.listWakeableBlockedDependents(child.id)).resolves.toEqual([
+      expect.objectContaining({
+        id: parentIssueId,
+        assigneeAgentId,
+        blockerIssueIds: [child.id],
+      }),
+    ]);
+  });
+
   it("treats done blockers on a shared workspace as ready while a foreign issue is in-flight", async () => {
     const {
       companyId,

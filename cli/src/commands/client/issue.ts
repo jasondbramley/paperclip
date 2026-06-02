@@ -61,6 +61,7 @@ interface IssueCreateOptions extends BaseClientOptions {
   parentId?: string;
   requestDepth?: string;
   billingCode?: string;
+  blockParentUntilDone?: boolean;
 }
 
 interface IssueUpdateOptions extends BaseClientOptions {
@@ -285,6 +286,7 @@ export function registerIssueCommands(program: Command): void {
       .option("--project-id <id>", "Project ID")
       .option("--goal-id <id>", "Goal ID")
       .option("--parent-id <id>", "Parent issue ID")
+      .option("--block-parent-until-done", "When used with --parent-id, block the parent issue until this issue is done")
       .option("--request-depth <n>", "Request depth integer")
       .option("--billing-code <code>", "Billing code")
       .action(async (opts: IssueCreateOptions) => {
@@ -299,6 +301,7 @@ export function registerIssueCommands(program: Command): void {
             projectId: opts.projectId,
             goalId: opts.goalId,
             parentId: opts.parentId,
+            blockParentUntilDone: opts.blockParentUntilDone,
             requestDepth: parseOptionalInt(opts.requestDepth),
             billingCode: opts.billingCode,
           });

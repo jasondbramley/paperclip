@@ -411,7 +411,17 @@ export const createIssueInputSchema = createIssueBaseSchema.extend({
   status: createIssueBaseSchema.shape.status.optional(),
 });
 
-export const createIssueSchema = withCreateIssueStatusDefault(createIssueBaseSchema);
+export const createIssueSchema = withCreateIssueStatusDefault(createIssueBaseSchema.extend({
+  blockParentUntilDone: z.boolean().optional().default(false),
+})).superRefine((value, ctx) => {
+  if (value.blockParentUntilDone && !value.parentId) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "blockParentUntilDone requires parentId",
+      path: ["blockParentUntilDone"],
+    });
+  }
+});
 
 export type CreateIssue = z.infer<typeof createIssueSchema>;
 
