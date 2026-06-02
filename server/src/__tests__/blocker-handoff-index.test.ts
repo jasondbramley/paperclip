@@ -3,10 +3,15 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { matchBlockerHandoffSignal } from "../services/issues.js";
 
+const TEST_IDS = vi.hoisted(() => ({
+  blockedIssueId: "11111111-1111-4111-8111-111111111111",
+  wakeCommentId: "22222222-2222-4222-8222-222222222222",
+}));
+
 const mockSuggestions = vi.hoisted(() => [
   {
     issue: {
-      id: "issue-blocked",
+      id: TEST_IDS.blockedIssueId,
       identifier: "ITO-1858",
       title: "Inside Agent client sweep",
       status: "blocked",
@@ -33,7 +38,7 @@ const mockIssueService = vi.hoisted(() => ({
   getComment: vi.fn(),
   getCommentCursor: vi.fn(async () => ({
     totalComments: 1,
-    latestCommentId: "comment-1",
+    latestCommentId: TEST_IDS.wakeCommentId,
     latestCommentAt: new Date("2026-06-02T09:52:40Z"),
   })),
   getCurrentScheduledRetry: vi.fn(async () => null),
@@ -150,7 +155,7 @@ describe("blocker handoff index", () => {
       updatedAt: new Date("2026-06-02T09:55:00Z"),
     });
     mockIssueService.getComment.mockResolvedValue({
-      id: "comment-1",
+      id: TEST_IDS.wakeCommentId,
       issueId: "chat-anchor",
       companyId: "company-1",
       body: "I have uploaded the inside agent reports into SharePoint for the top 11 clients.",
@@ -185,7 +190,7 @@ describe("blocker handoff index", () => {
   it("adds suggestions to heartbeat context when a wake comment is present", async () => {
     const res = await request(await createApp())
       .get("/api/issues/chat-anchor/heartbeat-context")
-      .query({ wakeCommentId: "comment-1" });
+      .query({ wakeCommentId: TEST_IDS.wakeCommentId });
 
     expect(res.status).toBe(200);
     expect(mockIssueService.listBlockerHandoffSuggestions).toHaveBeenCalledWith(
@@ -220,9 +225,9 @@ describe("blocker handoff index", () => {
             updatedAt: new Date("2026-06-02T09:55:00Z"),
           };
         }
-        if (id === "issue-blocked") {
+        if (id === TEST_IDS.blockedIssueId) {
           return {
-            id: "issue-blocked",
+            id: TEST_IDS.blockedIssueId,
             companyId: "company-1",
             identifier: "ITO-1858",
             title: "Inside Agent client sweep",
@@ -247,8 +252,8 @@ describe("blocker handoff index", () => {
     const res = await request(app)
       .post("/api/issues/chat-anchor/blocker-handoff-suggestions/decline")
       .send({
-        matchedIssueId: "issue-blocked",
-        wakeCommentId: "comment-1",
+        matchedIssueId: TEST_IDS.blockedIssueId,
+        wakeCommentId: TEST_IDS.wakeCommentId,
         reason: "Already relayed manually",
       });
 
@@ -259,8 +264,8 @@ describe("blocker handoff index", () => {
       entityType: "issue",
       entityId: "chat-anchor",
       details: expect.objectContaining({
-        matchedIssueId: "issue-blocked",
-        wakeCommentId: "comment-1",
+        matchedIssueId: TEST_IDS.blockedIssueId,
+        wakeCommentId: TEST_IDS.wakeCommentId,
       }),
     }));
   });
