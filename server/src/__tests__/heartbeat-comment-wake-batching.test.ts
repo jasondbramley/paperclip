@@ -1011,6 +1011,188 @@ describe("heartbeat comment wake batching", () => {
     }
   }, 120_000);
 
+  it("does not reopen a verified done issue from a stale agent-originated deferred reopen wake", async () => {
+    const gateway = await createControlledGatewayServer();
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Gateway Agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "openclaw_gateway",
+        adapterConfig: {
+          url: gateway.url,
+          headers: {
+            "x-openclaw-token": "gateway-token",
+          },
+          payloadTemplate: {
+            message: "wake now",
+          },
+          waitTimeoutMs: 2_000,
+        },
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Do not reopen stale done issue",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const firstRun = await heartbeat.wakeup(agentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_assigned",
+        },
+        requestedByActorType: "system",
+        requestedByActorId: null,
+      });
+
+      expect(firstRun).not.toBeNull();
+      await waitFor(async () => {
+        const run = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, firstRun!.id))
+          .then((rows) => rows[0] ?? null);
+        return run?.status === "running";
+      });
+
+      const completionComment = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId,
+          authorAgentId: agentId,
+          createdByRunId: firstRun?.id ?? null,
+          body: "Complete: verified done state.",
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      const deferredRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_reopened_via_comment",
+        payload: {
+          issueId,
+          commentId: completionComment.id,
+          mutation: "comment",
+          reopenedFrom: "done",
+        },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          commentId: completionComment.id,
+          wakeCommentId: completionComment.id,
+          wakeReason: "issue_reopened_via_comment",
+          source: "issue.comment.reopen",
+          reopenedFrom: "done",
+        },
+        requestedByActorType: "agent",
+        requestedByActorId: agentId,
+      });
+
+      expect(deferredRun).toBeNull();
+
+      await waitFor(async () => {
+        const deferred = await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        return Boolean(deferred);
+      });
+
+      await db
+        .update(issues)
+        .set({
+          status: "done",
+          completedAt: new Date(),
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, issueId));
+
+      gateway.releaseFirstWait();
+
+      await waitFor(() => gateway.getAgentPayloads().length === 2, 90_000);
+      await waitFor(async () => {
+        const runs = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.companyId, companyId));
+        return runs.length === 2 && runs.every((run) => run.status === "succeeded");
+      }, 90_000);
+
+      const issueAfterPromotion = await db
+        .select({
+          status: issues.status,
+          completedAt: issues.completedAt,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+
+      expect(issueAfterPromotion).toMatchObject({
+        status: "done",
+      });
+      expect(issueAfterPromotion?.completedAt).not.toBeNull();
+
+      const secondPayload = gateway.getAgentPayloads()[1] ?? {};
+      expect(secondPayload.paperclip).toMatchObject({
+        wake: {
+          reason: "issue_reopened_via_comment",
+          commentIds: [completionComment.id],
+          latestCommentId: completionComment.id,
+          issue: {
+            id: issueId,
+            identifier: `${issuePrefix}-1`,
+            title: "Do not reopen stale done issue",
+            status: "done",
+            priority: "medium",
+          },
+        },
+      });
+    } finally {
+      gateway.releaseFirstWait();
+      await gateway.close();
+    }
+  }, 120_000);
+
   it("queues exactly one follow-up run when an issue-bound run exits without a comment", async () => {
     const gateway = await createControlledGatewayServer();
     const companyId = randomUUID();
