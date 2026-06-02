@@ -114,6 +114,11 @@ const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
+const blockerHandoffDeclineSchema = z.object({
+  matchedIssueId: z.string().uuid(),
+  wakeCommentId: z.string().uuid().optional(),
+  reason: z.string().trim().max(2000).optional(),
+});
 
 type ParsedExecutionState = NonNullable<ReturnType<typeof parseIssueExecutionState>>;
 type NormalizedExecutionPolicy = NonNullable<ReturnType<typeof normalizeIssueExecutionPolicy>>;
@@ -1519,6 +1524,32 @@ export function issueRoutes(
     })));
   });
 
+  router.get("/companies/:companyId/blocker-handoff-index/search", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
+    if (!query) {
+      res.status(400).json({ error: "q is required" });
+      return;
+    }
+    const rawLimit = req.query.limit as string | undefined;
+    const parsedLimit = rawLimit !== undefined && /^\d+$/.test(rawLimit)
+      ? Number.parseInt(rawLimit, 10)
+      : null;
+    if (rawLimit !== undefined && (parsedLimit === null || !Number.isInteger(parsedLimit) || parsedLimit <= 0)) {
+      res.status(400).json({ error: "limit must be a positive integer" });
+      return;
+    }
+
+    const suggestions = await svc.listBlockerHandoffSuggestions(companyId, query, {
+      limit: parsedLimit,
+    });
+    res.json({
+      query,
+      suggestions,
+    });
+  });
+
   router.get("/companies/:companyId/issues/count", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -1668,6 +1699,9 @@ export function issueRoutes(
       relations,
       recoveryActionsByRelationIssue,
     );
+    const blockerHandoffSuggestions = wakeComment && wakeComment.issueId === issue.id
+      ? await svc.listBlockerHandoffSuggestions(issue.companyId, wakeComment.body, { limit: 5 })
+      : [];
 
     res.json({
       issue: {
@@ -1722,6 +1756,7 @@ export function issueRoutes(
         wakeComment && wakeComment.issueId === issue.id
           ? wakeComment
           : null,
+      blockerHandoffSuggestions,
       attachments: attachments.map((a) => ({
         id: a.id,
         filename: a.originalFilename,
@@ -1743,6 +1778,59 @@ export function issueRoutes(
       currentExecutionWorkspace,
     });
   });
+
+  router.post(
+    "/issues/:sourceIssueId/blocker-handoff-suggestions/decline",
+    validate(blockerHandoffDeclineSchema),
+    async (req, res) => {
+      const sourceIssueId = req.params.sourceIssueId as string;
+      const sourceIssue = await svc.getById(sourceIssueId);
+      if (!sourceIssue) {
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+      assertCompanyAccess(req, sourceIssue.companyId);
+
+      const { matchedIssueId, wakeCommentId, reason } = req.body as {
+        matchedIssueId: string;
+        wakeCommentId?: string;
+        reason?: string;
+      };
+
+      const matchedIssue = await svc.getById(matchedIssueId);
+      if (!matchedIssue || matchedIssue.companyId !== sourceIssue.companyId) {
+        res.status(404).json({ error: "Matched issue not found" });
+        return;
+      }
+
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId: sourceIssue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        action: "blocker_handoff_suggestion_declined",
+        entityType: "issue",
+        entityId: sourceIssue.id,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        details: {
+          matchedIssueId,
+          matchedIssueIdentifier: matchedIssue.identifier,
+          sourceIssueId: sourceIssue.id,
+          sourceIssueIdentifier: sourceIssue.identifier,
+          wakeCommentId: wakeCommentId ?? null,
+          reason: reason ?? null,
+        },
+      });
+
+      res.status(201).json({
+        ok: true,
+        logged: true,
+        sourceIssueId,
+        matchedIssueId,
+      });
+    },
+  );
 
   router.get("/issues/:id", async (req, res) => {
     const id = req.params.id as string;
