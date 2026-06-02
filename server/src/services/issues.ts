@@ -291,6 +291,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
   inheritExecutionWorkspaceFromIssueId?: string | null;
+  blockParentUntilDone?: boolean;
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -4014,6 +4015,7 @@ export function issueService(db: Db) {
         labelIds: inputLabelIds,
         blockedByIssueIds,
         inheritExecutionWorkspaceFromIssueId,
+        blockParentUntilDone,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -4030,6 +4032,9 @@ export function issueService(db: Db) {
       }
       if (data.assigneeUserId) {
         await assertAssignableUser(companyId, data.assigneeUserId);
+      }
+      if (blockParentUntilDone && !issueData.parentId) {
+        throw unprocessable("blockParentUntilDone requires parentId");
       }
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
@@ -4227,6 +4232,34 @@ export function issueService(db: Db) {
             issue.id,
             companyId,
             blockedByIssueIds,
+            {
+              agentId: issueData.createdByAgentId ?? null,
+              userId: issueData.createdByUserId ?? null,
+            },
+            tx,
+          );
+        }
+        if (blockParentUntilDone && issue.parentId) {
+          const parent = await tx
+            .select({ id: issues.id, companyId: issues.companyId })
+            .from(issues)
+            .where(and(eq(issues.id, issue.parentId), eq(issues.companyId, companyId)))
+            .then((rows) => rows[0] ?? null);
+          if (!parent) {
+            throw unprocessable("Parent issue not found in this company");
+          }
+          const existingParentBlockers = await tx
+            .select({ blockerIssueId: issueRelations.issueId })
+            .from(issueRelations)
+            .where(and(
+              eq(issueRelations.companyId, companyId),
+              eq(issueRelations.relatedIssueId, parent.id),
+              eq(issueRelations.type, "blocks"),
+            ));
+          await syncBlockedByIssueIds(
+            parent.id,
+            companyId,
+            [...new Set([...existingParentBlockers.map((row) => row.blockerIssueId), issue.id])],
             {
               agentId: issueData.createdByAgentId ?? null,
               userId: issueData.createdByUserId ?? null,
