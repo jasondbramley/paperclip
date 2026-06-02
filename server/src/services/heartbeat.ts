@@ -8430,6 +8430,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
         const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
+        const explicitDeferredReopen =
+          deferredContextSeed.resumeIntent === true ||
+          deferredContextSeed.followUpRequested === true ||
+          deferredContextSeed.explicitReopenRequested === true;
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
         const shouldReopenDeferredCommentWake =
@@ -8437,7 +8441,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           (issue.status === "done" || issue.status === "cancelled") &&
           (
             deferred.requestedByActorType === "user" ||
-            deferredWakeReason === "issue_reopened_via_comment"
+            (deferredWakeReason === "issue_reopened_via_comment" && explicitDeferredReopen)
           );
         let reopenedActivity: LogActivityInput | null = null;
 
