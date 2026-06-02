@@ -35,6 +35,7 @@ const mockSuggestions = vi.hoisted(() => [
 const mockIssueService = vi.hoisted(() => ({
   getAncestors: vi.fn(async () => []),
   getById: vi.fn(),
+  getByIdClearingTerminalExecution: vi.fn(),
   getComment: vi.fn(),
   getCommentCursor: vi.fn(async () => ({
     totalComments: 1,
@@ -136,7 +137,7 @@ async function createApp() {
 describe("blocker handoff index", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockIssueService.getById.mockResolvedValue({
+    const chatAnchorIssue = {
       id: "chat-anchor",
       companyId: "company-1",
       identifier: "ITO-541",
@@ -153,7 +154,9 @@ describe("blocker handoff index", () => {
       originKind: "manual",
       originId: null,
       updatedAt: new Date("2026-06-02T09:55:00Z"),
-    });
+    };
+    mockIssueService.getById.mockResolvedValue(chatAnchorIssue);
+    mockIssueService.getByIdClearingTerminalExecution.mockResolvedValue(chatAnchorIssue);
     mockIssueService.getComment.mockResolvedValue({
       id: TEST_IDS.wakeCommentId,
       issueId: "chat-anchor",

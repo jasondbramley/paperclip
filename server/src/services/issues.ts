@@ -2829,10 +2829,11 @@ export function issueService(db: Db) {
   }
 
   async function getIssueByIdentifier(identifier: string) {
+    const normalizedIdentifier = identifier.toUpperCase();
     const row = await db
       .select()
       .from(issues)
-      .where(eq(issues.identifier, identifier.toUpperCase()))
+      .where(eq(issues.identifier, normalizedIdentifier))
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
     const [enriched] = await withIssueLabels(db, [row]);
@@ -3865,6 +3866,20 @@ export function issueService(db: Db) {
         return null;
       }
       return getIssueByUuid(id);
+    },
+
+    getByIdClearingTerminalExecution: async (raw: string) => {
+      const existing = await (async () => {
+        const id = raw.trim();
+        const identifier = normalizeIssueReferenceIdentifier(id);
+        if (identifier) return getIssueByIdentifier(identifier);
+        if (!isUuidLike(id)) return null;
+        return getIssueByUuid(id);
+      })();
+      if (!existing) return null;
+
+      await clearExecutionRunIfTerminal(existing.id);
+      return getIssueByUuid(existing.id);
     },
 
     getByIdentifier: async (identifier: string) => {
