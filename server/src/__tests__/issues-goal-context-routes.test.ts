@@ -6,6 +6,7 @@ import { issueRoutes } from "../routes/issues.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
+  getByIdClearingTerminalExecution: vi.fn(),
   getAncestors: vi.fn(),
   getRelationSummaries: vi.fn(),
   findMentionedProjectIds: vi.fn(),
@@ -182,6 +183,7 @@ describe.sequential("issue goal context routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(legacyProjectLinkedIssue);
+    mockIssueService.getByIdClearingTerminalExecution.mockResolvedValue(legacyProjectLinkedIssue);
     mockIssueService.getAncestors.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.findMentionedProjectIds.mockResolvedValue([]);
@@ -337,10 +339,12 @@ describe.sequential("issue goal context routes", () => {
   });
 
   it("surfaces the current execution workspace from GET /issues/:id/heartbeat-context", async () => {
-    mockIssueService.getById.mockResolvedValue({
+    const issueWithWorkspace = {
       ...legacyProjectLinkedIssue,
       executionWorkspaceId: "55555555-5555-4555-8555-555555555555",
-    });
+    };
+    mockIssueService.getById.mockResolvedValue(issueWithWorkspace);
+    mockIssueService.getByIdClearingTerminalExecution.mockResolvedValue(issueWithWorkspace);
     mockExecutionWorkspaceService.getById.mockResolvedValue({
       id: "55555555-5555-4555-8555-555555555555",
       name: "PAP-581 workspace",
