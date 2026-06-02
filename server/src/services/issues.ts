@@ -114,6 +114,57 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_CHUNK_BYTES = 256_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS = 60_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
 const DELETED_ISSUE_COMMENT_BODY = "";
+const BLOCKER_HANDOFF_INDEX_MAX_CANDIDATES = 500;
+const BLOCKER_HANDOFF_DEFAULT_LIMIT = 5;
+const BLOCKER_HANDOFF_MAX_LIMIT = 25;
+const BLOCKER_HANDOFF_STOPWORDS = new Set([
+  "about",
+  "across",
+  "already",
+  "also",
+  "because",
+  "blocked",
+  "done",
+  "from",
+  "have",
+  "into",
+  "issue",
+  "just",
+  "more",
+  "need",
+  "needs",
+  "paperclip",
+  "please",
+  "that",
+  "their",
+  "there",
+  "this",
+  "ticket",
+  "tickets",
+  "today",
+  "with",
+]);
+
+export type BlockerHandoffSuggestion = {
+  issue: {
+    id: string;
+    identifier: string | null;
+    title: string;
+    status: string;
+    priority: string;
+    updatedAt: Date;
+  };
+  assignee: {
+    agentId: string | null;
+    agentName: string | null;
+    userId: string | null;
+  };
+  blockedBy: IssueRelationIssueSummary[];
+  confidence: "high" | "low";
+  score: number;
+  matchedSignalPhrases: string[];
+  relaySuggestion: string;
+};
 function assertTransition(from: string, to: string) {
   if (from === to) return;
   if (!ALL_ISSUE_STATUSES.includes(to)) {
@@ -3463,6 +3514,63 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
   }, 0);
 }
 
+function normalizeHandoffText(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function handoffTerms(value: string) {
+  const normalized = normalizeHandoffText(value);
+  if (!normalized) return [];
+  return [...new Set(
+    normalized
+      .split(" ")
+      .filter((term) => term.length >= 3 && !BLOCKER_HANDOFF_STOPWORDS.has(term)),
+  )];
+}
+
+function handoffNgrams(terms: string[], size: number) {
+  if (terms.length < size) return [];
+  const phrases: string[] = [];
+  for (let index = 0; index <= terms.length - size; index += 1) {
+    phrases.push(terms.slice(index, index + size).join(" "));
+  }
+  return phrases;
+}
+
+export function matchBlockerHandoffSignal(input: {
+  message: string;
+  issueText: string;
+  blockerText?: string;
+}): { score: number; confidence: "high" | "low"; matchedSignalPhrases: string[] } | null {
+  const messageTerms = handoffTerms(input.message);
+  if (messageTerms.length === 0) return null;
+
+  const issueText = normalizeHandoffText(`${input.issueText} ${input.blockerText ?? ""}`);
+  if (!issueText) return null;
+
+  const issueTerms = new Set(handoffTerms(issueText));
+  const matchedTerms = messageTerms.filter((term) => issueTerms.has(term));
+  const exactPhrases = [...handoffNgrams(messageTerms, 3), ...handoffNgrams(messageTerms, 2)]
+    .filter((phrase) => issueText.includes(phrase));
+  const uniquePhrases = [...new Set([...exactPhrases, ...matchedTerms])].slice(0, 8);
+  if (matchedTerms.length < 2 && exactPhrases.length === 0) return null;
+
+  const overlapRatio = matchedTerms.length / messageTerms.length;
+  const phraseBonus = Math.min(0.3, exactPhrases.length * 0.1);
+  const score = Math.min(1, Number((overlapRatio + phraseBonus).toFixed(3)));
+  if (score < 0.35) return null;
+
+  return {
+    score,
+    confidence: score >= 0.65 || matchedTerms.length >= 4 ? "high" : "low",
+    matchedSignalPhrases: uniquePhrases,
+  };
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -6772,6 +6880,88 @@ export function issueService(db: Db) {
         await tx.delete(assets).where(eq(assets.id, existing.assetId));
         return existing;
       }),
+
+    listBlockerHandoffSuggestions: async (
+      companyId: string,
+      message: string,
+      opts?: { limit?: number | null },
+    ): Promise<BlockerHandoffSuggestion[]> => {
+      const trimmedMessage = message.trim();
+      if (!trimmedMessage) return [];
+
+      const limit = Math.min(
+        Math.max(1, Math.floor(opts?.limit ?? BLOCKER_HANDOFF_DEFAULT_LIMIT)),
+        BLOCKER_HANDOFF_MAX_LIMIT,
+      );
+      const rows = await db
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+          title: issues.title,
+          description: issues.description,
+          status: issues.status,
+          priority: issues.priority,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeAgentName: agents.name,
+          assigneeUserId: issues.assigneeUserId,
+          updatedAt: issues.updatedAt,
+        })
+        .from(issues)
+        .leftJoin(agents, eq(issues.assigneeAgentId, agents.id))
+        .where(and(
+          eq(issues.companyId, companyId),
+          eq(issues.status, "blocked"),
+          isNull(issues.hiddenAt),
+        ))
+        .orderBy(desc(issues.updatedAt), desc(issues.id))
+        .limit(BLOCKER_HANDOFF_INDEX_MAX_CANDIDATES);
+
+      if (rows.length === 0) return [];
+
+      const relationMap = await blockedByMapForIssues(db, companyId, rows.map((row) => row.id));
+      return rows.flatMap((row) => {
+        const blockedBy = relationMap.get(row.id) ?? [];
+        const blockerText = blockedBy
+          .map((blocker) => `${blocker.identifier ?? ""} ${blocker.title} ${blocker.status}`)
+          .join(" ");
+        const match = matchBlockerHandoffSignal({
+          message: trimmedMessage,
+          issueText: `${row.identifier ?? ""} ${row.title} ${row.description ?? ""}`,
+          blockerText,
+        });
+        if (!match) return [];
+
+        const owner = row.assigneeAgentName
+          ? `${row.assigneeAgentName} (${row.assigneeAgentId})`
+          : row.assigneeAgentId
+            ? row.assigneeAgentId
+            : row.assigneeUserId ?? "unassigned";
+        const identifier = row.identifier ?? row.id;
+        return [{
+          issue: {
+            id: row.id,
+            identifier: row.identifier ?? null,
+            title: row.title,
+            status: row.status,
+            priority: row.priority,
+            updatedAt: row.updatedAt,
+          },
+          assignee: {
+            agentId: row.assigneeAgentId ?? null,
+            agentName: row.assigneeAgentName ?? null,
+            userId: row.assigneeUserId ?? null,
+          },
+          blockedBy,
+          confidence: match.confidence,
+          score: match.score,
+          matchedSignalPhrases: match.matchedSignalPhrases,
+          relaySuggestion:
+            `Likely unblocks ${identifier} (${owner}); relay this update to the blocked ticket and wake the assignee if the match is valid.`,
+        }];
+      })
+        .sort((a, b) => b.score - a.score || b.issue.updatedAt.getTime() - a.issue.updatedAt.getTime())
+        .slice(0, limit);
+    },
 
     findMentionedAgents: async (companyId: string, body: string) => {
       const explicitAgentMentionIds = extractAgentMentionIds(body);
