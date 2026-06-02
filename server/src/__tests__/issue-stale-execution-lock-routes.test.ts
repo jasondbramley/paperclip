@@ -69,8 +69,10 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
   async function seedCompanyAgentAndRuns() {
     const companyId = randomUUID();
     const agentId = randomUUID();
+    const handoffAgentId = randomUUID();
     const failedRunId = randomUUID();
     const currentRunId = randomUUID();
+    const succeededHandoffRunId = randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
@@ -78,17 +80,30 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await db.insert(agents).values([
+      {
+        id: agentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: handoffAgentId,
+        companyId,
+        name: "Head of Commercial",
+        role: "commercial",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
     await db.insert(heartbeatRuns).values([
       {
         id: failedRunId,
@@ -106,9 +121,17 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         invocationSource: "manual",
         startedAt: new Date(),
       },
+      {
+        id: succeededHandoffRunId,
+        companyId,
+        agentId: handoffAgentId,
+        status: "succeeded",
+        invocationSource: "manual",
+        finishedAt: new Date(),
+      },
     ]);
 
-    return { companyId, agentId, failedRunId, currentRunId };
+    return { companyId, agentId, handoffAgentId, failedRunId, currentRunId, succeededHandoffRunId };
   }
 
   function agentActor(companyId: string, agentId: string, runId: string): Express.Request["actor"] {
@@ -168,6 +191,59 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       title: "Recovered execution lock",
       checkoutRunId: currentRunId,
       executionRunId: currentRunId,
+    });
+  });
+
+  it("clears a terminal cross-agent execution marker when reading a todo issue", async () => {
+    const { companyId, agentId, succeededHandoffRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Cross-agent terminal marker",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: succeededHandoffRunId,
+      executionAgentNameKey: "head of commercial",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .get(`/api/issues/${issueId}`)
+      .send();
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({
+      id: issueId,
+      status: "todo",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
+
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionAgentNameKey: issues.executionAgentNameKey,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "todo",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
     });
   });
 

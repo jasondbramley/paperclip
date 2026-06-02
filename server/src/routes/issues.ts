@@ -1647,7 +1647,7 @@ export function issueRoutes(
 
   router.get("/issues/:id/heartbeat-context", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
+    const issue = await svc.getByIdClearingTerminalExecution(id);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
@@ -1834,7 +1834,7 @@ export function issueRoutes(
 
   router.get("/issues/:id", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
+    const issue = await svc.getByIdClearingTerminalExecution(id);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
