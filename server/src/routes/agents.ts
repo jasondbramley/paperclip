@@ -78,7 +78,7 @@ import {
   refreshAdapterModels,
   requireServerAdapter,
 } from "../adapters/index.js";
-import { redactAdapterConfigForResponse, redactEventPayload } from "../redaction.js";
+import { redactAdapterConfigForResponse, redactConfigForResponse, redactEventPayload } from "../redaction.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import { renderOrgChartSvg, renderOrgChartPng, type OrgNode, type OrgChartStyle, ORG_CHART_STYLES } from "./org-chart-svg.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -1493,12 +1493,17 @@ export function agentRoutes(
     };
   }
 
-  function redactAgentResponse<T extends { adapterConfig: unknown }>(agent: T): T {
+  function redactAgentResponse<T extends { adapterConfig: unknown; runtimeConfig?: unknown }>(agent: T): T {
     return {
       ...agent,
       adapterConfig: redactAdapterConfigForResponse(
         typeof agent.adapterConfig === "object" && agent.adapterConfig !== null
           ? (agent.adapterConfig as Record<string, unknown>)
+          : {},
+      ),
+      runtimeConfig: redactConfigForResponse(
+        typeof agent.runtimeConfig === "object" && agent.runtimeConfig !== null
+          ? (agent.runtimeConfig as Record<string, unknown>)
           : {},
       ),
     };
@@ -1516,7 +1521,7 @@ export function agentRoutes(
       reportsTo: agent.reportsTo,
       adapterType: agent.adapterType,
       adapterConfig: redactAdapterConfigForResponse(agent.adapterConfig),
-      runtimeConfig: redactEventPayload(agent.runtimeConfig),
+      runtimeConfig: redactConfigForResponse(agent.runtimeConfig),
       permissions: agent.permissions,
       updatedAt: agent.updatedAt,
     };
@@ -1532,7 +1537,7 @@ export function agentRoutes(
           ? (record.adapterConfig as Record<string, unknown>)
           : null,
       ),
-      runtimeConfig: redactEventPayload(
+      runtimeConfig: redactConfigForResponse(
         typeof record.runtimeConfig === "object" && record.runtimeConfig !== null
           ? (record.runtimeConfig as Record<string, unknown>)
           : {},

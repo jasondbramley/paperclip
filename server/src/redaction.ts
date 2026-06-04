@@ -133,7 +133,7 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
   return sanitizeRecord(payload);
 }
 
-export function redactAdapterConfigForResponse(adapterConfig: Record<string, unknown> | null): Record<string, unknown> | null {
+function redactAdapterEnvForResponse(adapterConfig: Record<string, unknown> | null): Record<string, unknown> | null {
   const sanitized = redactEventPayload(adapterConfig);
   if (!sanitized || !isPlainObject(sanitized.env)) return sanitized;
 
@@ -151,6 +151,33 @@ export function redactAdapterConfigForResponse(adapterConfig: Record<string, unk
   }
 
   return { ...sanitized, env };
+}
+
+function redactNestedAdapterConfigs(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactNestedAdapterConfigs);
+  if (!isPlainObject(value)) return value;
+
+  const redacted: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === "adapterConfig" && isPlainObject(entry)) {
+      redacted[key] = redactAdapterConfigForResponse(entry);
+      continue;
+    }
+    redacted[key] = redactNestedAdapterConfigs(entry);
+  }
+  return redacted;
+}
+
+export function redactAdapterConfigForResponse(adapterConfig: Record<string, unknown> | null): Record<string, unknown> | null {
+  const redacted = redactAdapterEnvForResponse(adapterConfig);
+  if (!redacted) return redacted;
+  return redactNestedAdapterConfigs(redacted) as Record<string, unknown>;
+}
+
+export function redactConfigForResponse(config: Record<string, unknown> | null): Record<string, unknown> | null {
+  const sanitized = redactEventPayload(config);
+  if (!sanitized) return sanitized;
+  return redactNestedAdapterConfigs(sanitized) as Record<string, unknown>;
 }
 
 export function redactSensitiveText(input: string): string {

@@ -554,6 +554,18 @@ describe.sequential("agent permission routes", () => {
           LEGACY_RAW_VALUE: "raw-value",
         },
       },
+      runtimeConfig: {
+        modelProfiles: {
+          cheap: {
+            adapterConfig: {
+              env: {
+                SAFE_LABEL: { type: "plain", value: "runtime-plain-value" },
+                LEGACY_RAW_VALUE: "runtime-raw-value",
+              },
+            },
+          },
+        },
+      },
     }]);
 
     const app = await createApp({
@@ -571,8 +583,62 @@ describe.sequential("agent permission routes", () => {
       SAFE_LABEL: { type: "plain", value: REDACTED_EVENT_VALUE },
       LEGACY_RAW_VALUE: REDACTED_EVENT_VALUE,
     });
+    expect(res.body[0].runtimeConfig.modelProfiles.cheap.adapterConfig.env).toEqual({
+      SAFE_LABEL: { type: "plain", value: REDACTED_EVENT_VALUE },
+      LEGACY_RAW_VALUE: REDACTED_EVENT_VALUE,
+    });
     expect(JSON.stringify(res.body)).not.toContain("plain-value");
     expect(JSON.stringify(res.body)).not.toContain("raw-value");
+    expect(JSON.stringify(res.body)).not.toContain("runtime-plain-value");
+    expect(JSON.stringify(res.body)).not.toContain("runtime-raw-value");
+  });
+
+  it("redacts adapter and runtime env values from privileged configuration responses", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: {
+        env: {
+          SAFE_LABEL: { type: "plain", value: "plain-value" },
+          LEGACY_RAW_VALUE: "raw-value",
+        },
+      },
+      runtimeConfig: {
+        modelProfiles: {
+          cheap: {
+            adapterConfig: {
+              env: {
+                SAFE_LABEL: { type: "plain", value: "runtime-plain-value" },
+                LEGACY_RAW_VALUE: "runtime-raw-value",
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}/configuration`));
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.env).toEqual({
+      SAFE_LABEL: { type: "plain", value: REDACTED_EVENT_VALUE },
+      LEGACY_RAW_VALUE: REDACTED_EVENT_VALUE,
+    });
+    expect(res.body.runtimeConfig.modelProfiles.cheap.adapterConfig.env).toEqual({
+      SAFE_LABEL: { type: "plain", value: REDACTED_EVENT_VALUE },
+      LEGACY_RAW_VALUE: REDACTED_EVENT_VALUE,
+    });
+    expect(JSON.stringify(res.body)).not.toContain("plain-value");
+    expect(JSON.stringify(res.body)).not.toContain("raw-value");
+    expect(JSON.stringify(res.body)).not.toContain("runtime-plain-value");
+    expect(JSON.stringify(res.body)).not.toContain("runtime-raw-value");
   });
 
   it("redacts adapter env values from config revision rollback responses", async () => {
