@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   REDACTED_EVENT_VALUE,
   redactAdapterConfigForResponse,
+  redactConfigForResponse,
   redactEventPayload,
   redactSensitiveText,
   sanitizeRecord,
@@ -98,6 +99,46 @@ describe("redaction", () => {
         LEGACY_RAW_VALUE: REDACTED_EVENT_VALUE,
       },
     });
+  });
+
+  it("redacts nested adapterConfig env values from response config objects", () => {
+    const result = redactConfigForResponse({
+      modelProfiles: {
+        cheap: {
+          adapterConfig: {
+            model: "gpt-5.4-mini",
+            env: {
+              SAFE_LABEL: { type: "plain", value: "safe-but-secret" },
+              LEGACY_RAW_VALUE: "legacy-secret",
+              GRAPH_SECRET: {
+                type: "secret_ref",
+                secretId: "11111111-1111-4111-8111-111111111111",
+                version: "latest",
+              },
+            },
+          },
+        },
+      },
+    });
+
+    expect(result?.modelProfiles).toEqual({
+      cheap: {
+        adapterConfig: {
+          model: "gpt-5.4-mini",
+          env: {
+            SAFE_LABEL: { type: "plain", value: REDACTED_EVENT_VALUE },
+            LEGACY_RAW_VALUE: REDACTED_EVENT_VALUE,
+            GRAPH_SECRET: {
+              type: "secret_ref",
+              secretId: "11111111-1111-4111-8111-111111111111",
+              version: "latest",
+            },
+          },
+        },
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("safe-but-secret");
+    expect(JSON.stringify(result)).not.toContain("legacy-secret");
   });
 
   it("redacts common secret shapes from unstructured text", () => {
