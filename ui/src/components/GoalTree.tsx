@@ -47,6 +47,17 @@ function GoalNode({ goal, children, allGoals, depth, goalLink, onSelect }: GoalN
       )}
       <span className="text-xs text-muted-foreground capitalize">{goal.level}</span>
       <span className="flex-1 truncate">{goal.title}</span>
+      <span className="text-[11px] uppercase tracking-wide text-muted-foreground">
+        {goal.ownershipKind === "agent_driven" ? "Agent" : "Human"}
+      </span>
+      {goal.progress && goal.progress.linkedIssueCount > 0 && (
+        <span
+          className="min-w-[92px] text-right text-xs text-muted-foreground"
+          title={`${goal.progress.closedIssueCount}/${goal.progress.linkedIssueCount} linked issues closed`}
+        >
+          {goal.progress.percent}% complete
+        </span>
+      )}
       <StatusBadge status={goal.status} />
     </>
   );

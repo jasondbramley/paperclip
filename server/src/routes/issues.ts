@@ -5440,6 +5440,10 @@ export function issueRoutes(
       actor.actorType,
     );
     await assertCanManageIssueMonitor(access, req, companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
+    const defaultGoalId =
+      createBody.goalId === undefined && createBody.projectId === undefined
+        ? (await goalsSvc.getDefaultCompanyGoal(companyId))?.id
+        : undefined;
     const issueId = randomUUID();
     const sourceTrust = await sourceTrustForActorWrite({
       id: issueId,
@@ -5449,6 +5453,7 @@ export function issueRoutes(
     }, actor);
     const issue = await svc.create(companyId, {
       ...createBody,
+      ...(defaultGoalId ? { goalId: defaultGoalId } : {}),
       ...(taskBridgeOriginForActor(req) ?? {}),
       id: issueId,
       executionPolicy,
@@ -5611,6 +5616,7 @@ export function issueRoutes(
       actor.actorType,
     );
     await assertCanManageIssueMonitor(access, req, parent.companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
+    const childGoalId = createBody.goalId === undefined && parent.goalId ? parent.goalId : undefined;
     const issueId = randomUUID();
     const sourceTrust = await sourceTrustForActorWrite({
       id: issueId,
@@ -5620,6 +5626,7 @@ export function issueRoutes(
     }, actor);
     const { issue, parentBlockerAdded } = await svc.createChild(parent.id, {
       ...createBody,
+      ...(childGoalId ? { goalId: childGoalId } : {}),
       ...(taskBridgeOriginForActor(req) ?? {}),
       id: issueId,
       executionPolicy,
