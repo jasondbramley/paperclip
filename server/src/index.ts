@@ -719,6 +719,12 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
         }
       })
+      .then(async () => {
+        const contextUsage = await heartbeat.scanAgentContextUsage();
+        if (contextUsage.warningsCreated > 0 || contextUsage.preemptsCreated > 0) {
+          logger.warn({ ...contextUsage }, "startup agent context monitor created review work");
+        }
+      })
       .catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       });
@@ -803,7 +809,12 @@ export async function startServer(): Promise<StartedServer> {
             logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
           }
         })
-        .then(() => {
+        .then(async () => {
+          const contextUsage = await heartbeat.scanAgentContextUsage();
+          if (contextUsage.warningsCreated > 0 || contextUsage.preemptsCreated > 0) {
+            logger.warn({ ...contextUsage }, "periodic agent context monitor created review work");
+          }
+
           const elapsedMs = Date.now() - reconcileStartMs;
           if (elapsedMs > 10_000) {
             logger.warn({ elapsedMs }, "periodic heartbeat reconcile completed slowly");
