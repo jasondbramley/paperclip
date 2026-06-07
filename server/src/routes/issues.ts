@@ -2658,9 +2658,14 @@ export function issueRoutes(
       normalizeIssueExecutionPolicy(req.body.executionPolicy),
       actor.actorType,
     );
+    const defaultGoalId =
+      req.body.goalId === undefined && req.body.projectId === undefined
+        ? (await goalsSvc.getDefaultCompanyGoal(companyId))?.id
+        : undefined;
+    const createFields = defaultGoalId ? { ...req.body, goalId: defaultGoalId } : req.body;
     assertCanManageIssueMonitor(req, req.body.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
     const issue = await svc.create(companyId, {
-      ...req.body,
+      ...createFields,
       executionPolicy,
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -2755,8 +2760,10 @@ export function issueRoutes(
       actor.actorType,
     );
     assertCanManageIssueMonitor(req, req.body.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
+    const childGoalId = req.body.goalId === undefined && parent.goalId ? parent.goalId : undefined;
+    const childFields = childGoalId ? { ...req.body, goalId: childGoalId } : req.body;
     const { issue, parentBlockerAdded } = await svc.createChild(parent.id, {
-      ...req.body,
+      ...childFields,
       executionPolicy,
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
