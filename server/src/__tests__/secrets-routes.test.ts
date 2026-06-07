@@ -93,6 +93,61 @@ describe("secret routes", () => {
     });
   });
 
+  it("passes accepted secret create fields through validation to the service", async () => {
+    const createdAt = new Date("2026-05-06T00:00:00.000Z");
+    mockSecretService.create.mockResolvedValue({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      key: "openai.api-key",
+      name: "OpenAI API Key",
+      provider: "local_encrypted",
+      status: "active",
+      managedMode: "paperclip_managed",
+      externalRef: "paperclip://company-1/openai.api-key/1",
+      providerConfigId: "22222222-2222-4222-8222-222222222222",
+      providerMetadata: { owner: "platform" },
+      latestVersion: 1,
+      description: "Used by coding agents",
+      lastResolvedAt: null,
+      lastRotatedAt: createdAt,
+      deletedAt: null,
+      createdByAgentId: null,
+      createdByUserId: "user-1",
+      createdAt,
+      updatedAt: createdAt,
+    });
+
+    const res = await request(createApp()).post("/api/companies/company-1/secrets").send({
+      name: "OpenAI API Key",
+      key: "openai.api-key",
+      provider: "local_encrypted",
+      providerConfigId: "22222222-2222-4222-8222-222222222222",
+      managedMode: "paperclip_managed",
+      value: "secret-value",
+      description: "Used by coding agents",
+      providerVersionRef: "version-1",
+      providerMetadata: { owner: "platform" },
+    });
+
+    expect(res.status).toBe(201);
+    expect(mockSecretService.create).toHaveBeenCalledWith(
+      "company-1",
+      {
+        name: "OpenAI API Key",
+        key: "openai.api-key",
+        provider: "local_encrypted",
+        providerConfigId: "22222222-2222-4222-8222-222222222222",
+        managedMode: "paperclip_managed",
+        value: "secret-value",
+        description: "Used by coding agents",
+        externalRef: undefined,
+        providerVersionRef: "version-1",
+        providerMetadata: { owner: "platform" },
+      },
+      { userId: "user-1", agentId: null },
+    );
+  });
+
   it("rejects managed secret creation when externalRef is supplied", async () => {
     const res = await request(createApp()).post("/api/companies/company-1/secrets").send({
       name: "OpenAI API Key",
