@@ -592,6 +592,7 @@ export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 export const SECRET_PROVIDERS = [
   "local_encrypted",
   "aws_secrets_manager",
+  "azure_keyvault",
   "gcp_secret_manager",
   "vault",
 ] as const;

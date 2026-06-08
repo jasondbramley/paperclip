@@ -140,6 +140,12 @@ export interface AwsSecretsManagerProviderConfig {
   environmentTag?: string | null;
 }
 
+export interface AzureKeyVaultProviderConfig {
+  vaultUri: string;
+  namespace?: string | null;
+  secretNamePrefix?: string | null;
+}
+
 export interface GcpSecretManagerProviderConfig {
   projectId?: string | null;
   location?: string | null;
@@ -157,6 +163,7 @@ export interface VaultProviderConfig {
 export type SecretProviderConfigPayload =
   | LocalEncryptedProviderConfig
   | AwsSecretsManagerProviderConfig
+  | AzureKeyVaultProviderConfig
   | GcpSecretManagerProviderConfig
   | VaultProviderConfig;
 

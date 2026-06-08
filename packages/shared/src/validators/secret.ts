@@ -251,6 +251,17 @@ export const awsSecretsManagerProviderConfigSchema = z.object({
   environmentTag: optionalSafeShortText,
 }).strict();
 
+const vaultUriPattern = /^https:\/\/[a-zA-Z0-9-]+\.vault\.azure\.net\/?$/;
+
+export const azureKeyVaultProviderConfigSchema = z.object({
+  vaultUri: z.string().trim().regex(
+    vaultUriPattern,
+    "vaultUri must be a standard Azure Key Vault URI: https://<name>.vault.azure.net",
+  ).transform((v) => v.replace(/\/+$/, "")),
+  namespace: optionalSafeShortText,
+  secretNamePrefix: optionalSafeShortText,
+}).strict();
+
 export const gcpSecretManagerProviderConfigSchema = z.object({
   projectId: z.string().trim().min(1).max(128).regex(/^[a-z][a-z0-9-]{4,127}$/).optional().nullable(),
   location: optionalSafeShortText,
@@ -306,6 +317,7 @@ export const vaultProviderConfigSchema = z.object({
 export const secretProviderConfigPayloadSchema = z.discriminatedUnion("provider", [
   z.object({ provider: z.literal("local_encrypted"), config: localEncryptedProviderConfigSchema }),
   z.object({ provider: z.literal("aws_secrets_manager"), config: awsSecretsManagerProviderConfigSchema }),
+  z.object({ provider: z.literal("azure_keyvault"), config: azureKeyVaultProviderConfigSchema }),
   z.object({ provider: z.literal("gcp_secret_manager"), config: gcpSecretManagerProviderConfigSchema }),
   z.object({ provider: z.literal("vault"), config: vaultProviderConfigSchema }),
 ]);

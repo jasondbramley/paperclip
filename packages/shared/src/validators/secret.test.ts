@@ -278,4 +278,49 @@ describe("secret validators", () => {
       }),
     ).toThrow();
   });
+
+  it("accepts valid Azure Key Vault provider vault config", () => {
+    const parsed = secretProviderConfigPayloadSchema.parse({
+      provider: "azure_keyvault",
+      config: {
+        vaultUri: "https://my-vault.vault.azure.net/",
+        namespace: "production",
+        secretNamePrefix: "paperclip",
+      },
+    });
+
+    expect(parsed.provider).toBe("azure_keyvault");
+    if (parsed.provider !== "azure_keyvault") throw new Error("Expected azure_keyvault provider payload");
+    // trailing slash should be stripped
+    expect(parsed.config.vaultUri).toBe("https://my-vault.vault.azure.net");
+    expect(parsed.config.namespace).toBe("production");
+    expect(parsed.config.secretNamePrefix).toBe("paperclip");
+  });
+
+  it("accepts Azure Key Vault provider vault config with only vaultUri", () => {
+    expect(() =>
+      createSecretProviderConfigSchema.parse({
+        provider: "azure_keyvault",
+        displayName: "ITO Key Vault",
+        config: { vaultUri: "https://ito-msp-portal-dev-kv.vault.azure.net" },
+      }),
+    ).not.toThrow();
+  });
+
+  it.each([
+    "https://my-vault.vault.azure.net/secrets/foo",
+    "https://my-vault.vault.azure.net?code=abc",
+    "https://my-vault.vault.azure.net#foo",
+    "https://user:pass@my-vault.vault.azure.net",
+    "https://my-vault.not-azure.net",
+    "http://my-vault.vault.azure.net",
+    "",
+  ])("rejects invalid Azure Key Vault vaultUri: %s", (vaultUri) => {
+    expect(() =>
+      secretProviderConfigPayloadSchema.parse({
+        provider: "azure_keyvault",
+        config: { vaultUri },
+      }),
+    ).toThrow();
+  });
 });

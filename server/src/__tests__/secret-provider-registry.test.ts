@@ -43,6 +43,11 @@ describe("secret provider registry", () => {
           supportsExternalReferences: true,
           configured: false,
         }),
+        expect.objectContaining({
+          id: "azure_keyvault",
+          supportsManagedValues: true,
+          supportsExternalReferences: true,
+        }),
       ]),
     );
   });
