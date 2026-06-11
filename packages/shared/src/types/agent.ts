@@ -70,6 +70,8 @@ export interface AgentChainOfCommandEntry {
   title: string | null;
 }
 
+export type AgentExternalRunState = Extract<AgentStatus, "idle" | "running">;
+
 export interface Agent {
   id: string;
   companyId: string;
@@ -91,6 +93,8 @@ export interface Agent {
   pausedAt: Date | null;
   permissions: AgentPermissions;
   lastHeartbeatAt: Date | null;
+  externalRunState?: AgentExternalRunState | null;
+  externalSeenAt?: Date | null;
   metadata: Record<string, unknown> | null;
   createdAt: Date;
   updatedAt: Date;

@@ -14,6 +14,7 @@ import { EntityRow } from "../components/EntityRow";
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { relativeTime, cn, agentRouteRef, agentUrl } from "../lib/utils";
+import { agentDisplayStatus } from "../lib/agent-display-status";
 import { PageTabBar } from "../components/PageTabBar";
 import { Tabs } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
@@ -37,7 +38,7 @@ function matchesFilter(status: string, tab: FilterTab, showTerminated: boolean):
 
 function filterAgents(agents: Agent[], tab: FilterTab, showTerminated: boolean): Agent[] {
   return agents
-    .filter((a) => matchesFilter(a.status, tab, showTerminated))
+    .filter((a) => matchesFilter(agentDisplayStatus(a), tab, showTerminated))
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -48,11 +49,18 @@ function getConfiguredModel(agent: Agent): string | null {
   return model.length > 0 ? model : null;
 }
 
-function filterOrgTree(nodes: OrgNode[], tab: FilterTab, showTerminated: boolean): OrgNode[] {
+function filterOrgTree(
+  nodes: OrgNode[],
+  tab: FilterTab,
+  showTerminated: boolean,
+  agentMap: Map<string, Agent>,
+): OrgNode[] {
   return nodes
     .reduce<OrgNode[]>((acc, node) => {
-      const filteredReports = filterOrgTree(node.reports, tab, showTerminated);
-      if (matchesFilter(node.status, tab, showTerminated) || filteredReports.length > 0) {
+      const agent = agentMap.get(node.id);
+      const displayStatus = agent ? agentDisplayStatus(agent) : node.status;
+      const filteredReports = filterOrgTree(node.reports, tab, showTerminated, agentMap);
+      if (matchesFilter(displayStatus, tab, showTerminated) || filteredReports.length > 0) {
         acc.push({ ...node, reports: filteredReports });
       }
       return acc;
@@ -128,7 +136,7 @@ export function Agents() {
   }
 
   const filtered = filterAgents(agents ?? [], tab, showTerminated);
-  const filteredOrg = filterOrgTree(orgTree ?? [], tab, showTerminated);
+  const filteredOrg = filterOrgTree(orgTree ?? [], tab, showTerminated, agentMap);
 
   return (
     <div className="space-y-4">
@@ -225,6 +233,7 @@ export function Agents() {
       {effectiveView === "list" && filtered.length > 0 && (
         <div className="border border-border">
           {filtered.map((agent) => {
+            const displayStatus = agentDisplayStatus(agent);
             return (
               <EntityRow
                 key={agent.id}
@@ -235,7 +244,7 @@ export function Agents() {
                 leading={
                   <span className="relative flex h-2.5 w-2.5">
                     <span
-                      className={`absolute inline-flex h-full w-full rounded-full ${agentStatusDot[agent.status] ?? agentStatusDotDefault}`}
+                      className={`absolute inline-flex h-full w-full rounded-full ${agentStatusDot[displayStatus] ?? agentStatusDotDefault}`}
                     />
                   </span>
                 }
@@ -249,7 +258,7 @@ export function Agents() {
                           liveCount={liveRunByAgent.get(agent.id)!.liveCount}
                         />
                       ) : (
-                        <StatusBadge status={agent.status} />
+                        <StatusBadge status={displayStatus} />
                       )}
                     </span>
                     <div className="hidden sm:flex items-center gap-3">
@@ -273,7 +282,7 @@ export function Agents() {
                         {agent.lastHeartbeatAt ? relativeTime(agent.lastHeartbeatAt) : "—"}
                       </span>
                       <span className="w-20 flex justify-end">
-                        <StatusBadge status={agent.status} />
+                        <StatusBadge status={displayStatus} />
                       </span>
                     </div>
                   </div>
@@ -329,7 +338,8 @@ function OrgTreeNode({
 }) {
   const agent = agentMap.get(node.id);
 
-  const statusColor = agentStatusDot[node.status] ?? agentStatusDotDefault;
+  const displayStatus = agent ? agentDisplayStatus(agent) : node.status;
+  const statusColor = agentStatusDot[displayStatus] ?? agentStatusDotDefault;
 
   return (
     <div style={{ paddingLeft: depth * 24 }}>
@@ -356,7 +366,7 @@ function OrgTreeNode({
                 liveCount={liveRunByAgent.get(node.id)!.liveCount}
               />
             ) : (
-              <StatusBadge status={node.status} />
+              <StatusBadge status={displayStatus} />
             )}
           </span>
           <div className="hidden sm:flex items-center gap-3">
@@ -384,7 +394,7 @@ function OrgTreeNode({
               </>
             )}
             <span className="w-20 flex justify-end">
-              <StatusBadge status={node.status} />
+              <StatusBadge status={displayStatus} />
             </span>
           </div>
         </div>
