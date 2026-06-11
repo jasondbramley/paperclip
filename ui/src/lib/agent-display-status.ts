@@ -2,7 +2,9 @@ import type { Agent, AgentStatus } from "@paperclipai/shared";
 
 const EXTERNAL_STATE_FRESH_MS = 90_000;
 
-type AgentDisplayStatusInput = Pick<Agent, "status" | "externalRunState" | "externalSeenAt">;
+type AgentDisplayStatusInput = Pick<Agent, "status" | "externalRunState"> & {
+  externalSeenAt?: Date | string | null;
+};
 
 function timestampMs(value: Date | string | null | undefined): number | null {
   if (!value) return null;
