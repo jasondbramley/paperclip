@@ -51,6 +51,7 @@ import { readSourceResolvedWatchdogFold } from "../lib/source-resolved-watchdog-
 import { buildSameOriginWebSocketUrl } from "../lib/websocket-url";
 import { formatCents, formatDate, relativeTime, formatTokens, visibleRunCostUsd } from "../lib/utils";
 import { cn } from "../lib/utils";
+import { agentDisplayStatus } from "../lib/agent-display-status";
 import { describeRunRetryState } from "../lib/runRetryState";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -948,6 +949,7 @@ export function AgentDetail() {
   }
   const isPendingApproval = agent.status === "pending_approval";
   const hasInvalidOrgChain = agent.orgChainHealth?.status === "invalid_org_chain";
+  const displayStatus = agentDisplayStatus(agent);
   const showConfigActionBar = (activeView === "configuration" || activeView === "instructions") && (configDirty || configSaving);
   const showLeftAgentNotice = agentMembershipState === "left" && !dismissedLeftAgentIds.has(agent.id);
   const agentMembershipPending =
@@ -1039,6 +1041,7 @@ export function AgentDetail() {
           actionsDisabled={agentAction.isPending}
           workActionsDisabled={hasInvalidOrgChain}
           workActionsDisabledReason="Repair this agent's reporting chain before assigning tasks or starting runs"
+          statusOverride={displayStatus}
           onActionError={setActionError}
         >
           {mobileLiveRun && (

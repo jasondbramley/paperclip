@@ -150,6 +150,7 @@ export function AgentActionButtons({
   assignLabel = "Assign Task",
   runLabel = "Run now",
   showStatus = true,
+  statusOverride,
   actionsDisabled = false,
   workActionsDisabled = false,
   workActionsDisabledReason,
@@ -164,6 +165,11 @@ export function AgentActionButtons({
   assignLabel?: string;
   runLabel?: string;
   showStatus?: boolean;
+  /**
+   * Optional display status (e.g. freshness-gated external Hermes run state)
+   * used for the status badge instead of the raw persisted agent status.
+   */
+  statusOverride?: Agent["status"];
   actionsDisabled?: boolean;
   workActionsDisabled?: boolean;
   workActionsDisabledReason?: string;
@@ -329,7 +335,7 @@ export function AgentActionButtons({
       )}
       {showStatus && (
         <span className="hidden sm:inline">
-          <AgentStatusBadge status={agent.status} />
+          <AgentStatusBadge status={statusOverride ?? agent.status} />
         </span>
       )}
       {children}

@@ -17,6 +17,7 @@ import { EntityRow } from "../components/EntityRow";
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { relativeTime, cn, agentRouteRef, agentUrl } from "../lib/utils";
+import { agentDisplayStatus } from "../lib/agent-display-status";
 import { PageTabBar } from "../components/PageTabBar";
 import { Tabs } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
@@ -67,7 +68,7 @@ function matchesFilter(status: string, tab: FilterTab): boolean {
 
 function filterAgents(agents: Agent[], tab: FilterTab): Agent[] {
   return agents
-    .filter((a) => !HIDDEN_AGENT_STATUSES.has(a.status) && matchesFilter(a.status, tab))
+    .filter((a) => !HIDDEN_AGENT_STATUSES.has(a.status) && matchesFilter(agentDisplayStatus(a), tab))
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -133,17 +134,19 @@ function resolveAgentEnvironment(
     : describeMissingEnvironment(environmentId);
 }
 
-function filterOrgTree(nodes: OrgNode[], tab: FilterTab): OrgNode[] {
+function filterOrgTree(nodes: OrgNode[], tab: FilterTab, agentMap: Map<string, Agent>): OrgNode[] {
   return nodes
     .reduce<OrgNode[]>((acc, node) => {
-      const filteredReports = filterOrgTree(node.reports, tab);
+      const agent = agentMap.get(node.id);
+      const displayStatus = agent ? agentDisplayStatus(agent) : node.status;
+      const filteredReports = filterOrgTree(node.reports, tab, agentMap);
       // Hidden agents (terminated / pending_approval) never render as a row, but
       // any visible reports are promoted so the tree doesn't lose live agents.
       if (HIDDEN_AGENT_STATUSES.has(node.status)) {
         acc.push(...filteredReports);
         return acc;
       }
-      if (matchesFilter(node.status, tab) || filteredReports.length > 0) {
+      if (matchesFilter(displayStatus, tab) || filteredReports.length > 0) {
         acc.push({ ...node, reports: filteredReports });
       }
       return acc;
@@ -260,7 +263,7 @@ export function Agents() {
   }
 
   const filtered = filterAgents(agents ?? [], tab);
-  const filteredOrg = filterOrgTree(orgTree ?? [], tab);
+  const filteredOrg = filterOrgTree(orgTree ?? [], tab, agentMap);
   const environmentDataLoading = environmentsEnabled && environments === undefined;
   const showEnvironmentColumn = environmentsEnabled && (environments === undefined || environments.length > 1);
   const resolveRenderedEnvironment = (agentId: string) => (
@@ -271,6 +274,7 @@ export function Agents() {
 
   const renderAgentRow = (agent: Agent) => {
     const hasInvalidOrgChain = agent.orgChainHealth?.status === "invalid_org_chain";
+    const displayStatus = agentDisplayStatus(agent);
     return (
       <EntityRow
         key={agent.id}
@@ -290,7 +294,7 @@ export function Agents() {
         leading={hasInvalidOrgChain ? (
           <AlertTriangle className="h-3.5 w-3.5 text-amber-500" aria-label="Invalid reporting chain" />
         ) : (
-          <AgentStatusCapsule status={agent.status} />
+          <AgentStatusCapsule status={displayStatus} />
         )}
         meta={
           <div className="hidden xl:flex items-center gap-3">
@@ -311,7 +315,7 @@ export function Agents() {
                   liveCount={liveRunByAgent.get(agent.id)!.liveCount}
                 />
               ) : (
-                <AgentStatusBadge status={agent.status} />
+                <AgentStatusBadge status={displayStatus} />
               )}
             </span>
             <div className="hidden sm:flex items-center gap-3">
@@ -323,7 +327,7 @@ export function Agents() {
                 />
               )}
               <span className="w-20 flex justify-end">
-                <AgentStatusBadge status={agent.status} />
+                <AgentStatusBadge status={displayStatus} />
               </span>
             </div>
             {/* Row actions mirror the agent detail page; stop the click
@@ -510,6 +514,7 @@ function OrgTreeNode({
 }) {
   const agent = agentMap.get(node.id);
   const hasInvalidOrgChain = Boolean(agent && agent.orgChainHealth?.status === "invalid_org_chain");
+  const displayStatus = agent ? agentDisplayStatus(agent) : node.status;
   const membershipState = resourceMembershipState(memberships, "agent", node.id);
   const pending = membershipMutation.isPending &&
     membershipMutation.variables?.resourceType === "agent" &&
@@ -546,7 +551,7 @@ function OrgTreeNode({
                 liveCount={liveRunByAgent.get(node.id)!.liveCount}
               />
             ) : (
-              <AgentStatusBadge status={node.status} />
+              <AgentStatusBadge status={displayStatus} />
             )}
           </span>
           <div className="hidden sm:flex items-center gap-3">
@@ -571,7 +576,7 @@ function OrgTreeNode({
               </div>
             )}
             <span className="w-20 flex justify-end">
-              <AgentStatusBadge status={node.status} />
+              <AgentStatusBadge status={displayStatus} />
             </span>
           </div>
           <MembershipAction
