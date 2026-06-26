@@ -157,7 +157,7 @@ describe("run liveness classifier", () => {
         description: "Create the proposal plan for the pilot.",
       },
       resultJson: {
-        summary: "Completed the implementation plan and marked the planning task done.",
+        summary: "Created the implementation plan document and updated the proposal.",
       },
     });
 
