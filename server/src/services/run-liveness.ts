@@ -75,6 +75,8 @@ const RUNNABLE_RE =
 const PLAN_TASK_TITLE_RE = /\b(?:plan|planning|analysis|investigation|research|report|proposal|design doc|write-?up)\b/i;
 const PLAN_TASK_DESCRIPTION_RE =
   /\b(?:create|write|produce|draft|update|revise|prepare)\s+(?:a\s+|the\s+)?(?:plan|analysis|investigation|research report|report|proposal|design doc|write-?up)\b/i;
+const EXECUTION_CLAIM_RE =
+  /\b(?:i\s+)?(?:implemented|fixed|updated|changed|created|added|removed|deleted|wrote|committed|pushed|opened|merged|deployed|ran|executed|tested|verified|validated|built|linted|type-?checked|created\s+(?:a\s+)?(?:pr|pull request|ticket|issue)|opened\s+(?:a\s+)?(?:pr|pull request))\b/i;
 
 function compactReason(reason: string) {
   return reason.length <= 500 ? reason : `${reason.slice(0, 497)}...`;
@@ -167,6 +169,15 @@ export function isPlanningOrDocumentTask(issue: RunLivenessIssueInput | null | u
   if (!issue) return false;
   if (PLAN_TASK_TITLE_RE.test(issue.title)) return true;
   return PLAN_TASK_DESCRIPTION_RE.test(issue.description ?? "");
+}
+
+export function claimsExecutedWorkWithoutEvidence(input: RunLivenessClassificationInput) {
+  const evidence = normalizeEvidence(input.evidence);
+  if (hasConcreteActionEvidence(evidence)) return false;
+  if (isPlanningOrDocumentTask(input.issue) || evidence.planDocumentRevisionsCreated > 0) return false;
+  const text = actionabilityText(input);
+  if (!text) return false;
+  return EXECUTION_CLAIM_RE.test(text);
 }
 
 function normalizeEvidence(evidence: Partial<RunLivenessEvidenceInput> | null | undefined): RunLivenessEvidenceInput {
@@ -298,6 +309,7 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
   const usefulOutput = hasUsefulOutput(input);
   const concreteEvidence = hasConcreteActionEvidence(evidence);
   const planExempt = isPlanningOrDocumentTask(input.issue) || evidence.planDocumentRevisionsCreated > 0;
+  const claimedExecutionWithoutEvidence = claimsExecutedWorkWithoutEvidence(input);
   const lastUsefulActionAt = concreteEvidence ? evidence.latestEvidenceAt : null;
 
   const output = (state: RunLivenessState, reason: string, nextAction: string | null = null): RunLivenessClassification => ({
@@ -311,6 +323,14 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
 
   if (input.runStatus !== "succeeded") {
     return output("failed", input.errorCode ? `Run ended with ${input.runStatus} (${input.errorCode})` : `Run ended with ${input.runStatus}`);
+  }
+
+  if (claimedExecutionWithoutEvidence) {
+    return output(
+      "needs_followup",
+      "Run claimed executed work but has no concrete tool, side-effect, or verification evidence",
+      nextAction,
+    );
   }
 
   if (issueStatus === "done" || issueStatus === "cancelled") {
