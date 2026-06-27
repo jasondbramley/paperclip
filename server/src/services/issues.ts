@@ -5211,6 +5211,41 @@ export function issueService(db: Db) {
       });
     },
 
+    containComment: async (commentId: string, input: { body: string; metadata: IssueCommentMetadata }) => {
+      const currentUserRedactionOptions = {
+        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+      };
+      const body = redactCurrentUserText(input.body, currentUserRedactionOptions);
+      const metadata = issueCommentMetadataSchema.parse(input.metadata);
+
+      return db.transaction(async (tx) => {
+        const [comment] = await tx
+          .update(issueComments)
+          .set({
+            body,
+            metadata,
+            presentation: {
+              kind: "system_notice",
+              tone: "danger",
+              title: "Comment quarantined",
+              detailsDefaultOpen: false,
+            },
+            updatedAt: new Date(),
+          })
+          .where(eq(issueComments.id, commentId))
+          .returning();
+
+        if (!comment) return null;
+
+        await tx
+          .update(issues)
+          .set({ updatedAt: new Date() })
+          .where(eq(issues.id, comment.issueId));
+
+        return redactIssueComment(comment, currentUserRedactionOptions.enabled);
+      });
+    },
+
     addComment: async (
       issueId: string,
       body: string,
