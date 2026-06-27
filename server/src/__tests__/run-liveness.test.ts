@@ -116,6 +116,49 @@ describe("run liveness classifier", () => {
       resultJson: {
         summary: "Finished the implementation.",
       },
+      evidence: {
+        toolOrActionEventsCreated: 1,
+        latestEvidenceAt: new Date("2026-04-18T12:00:00Z"),
+      },
+    });
+
+    expect(classification.livenessState).toBe("completed");
+  });
+
+  it("hard-stops claimed execution when there is no tool or side-effect evidence", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      issue: {
+        ...baseInput.issue,
+        status: "done",
+      },
+      resultJson: {
+        summary: "Implemented the guardrail, ran the regression tests, and marked the issue done.",
+      },
+      evidence: {
+        workspaceOperationsCreated: 1,
+        latestEvidenceAt: new Date("2026-04-18T12:00:00Z"),
+      },
+    });
+
+    expect(classification.livenessState).toBe("needs_followup");
+    expect(classification.livenessReason).toBe(
+      "Run claimed executed work but has no concrete tool, side-effect, or verification evidence",
+    );
+    expect(classification.lastUsefulActionAt).toBeNull();
+  });
+
+  it("does not hard-stop planning-only deliverables that intentionally produce a plan", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      issue: {
+        status: "done",
+        title: "Draft implementation plan",
+        description: "Create the proposal plan for the pilot.",
+      },
+      resultJson: {
+        summary: "Created the implementation plan document and updated the proposal.",
+      },
     });
 
     expect(classification.livenessState).toBe("completed");
