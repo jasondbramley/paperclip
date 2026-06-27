@@ -179,6 +179,21 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
   };
 }
 
+export function isDeliberateLongLivedChatMirror(issue: Pick<IssueRow, "title" | "description">) {
+  const title = issue.title.toLowerCase();
+  const description = (issue.description ?? "").toLowerCase();
+  const combined = `${title}\n${description}`;
+
+  const isChatMirror = title.includes("chat mirror") ||
+    description.includes("chat-bridge daemon") ||
+    description.includes("chat bridge daemon");
+  const isExplicitlyLongLived = combined.includes("long-lived") ||
+    combined.includes("do not close") ||
+    combined.includes("conversation ticket");
+
+  return isChatMirror && isExplicitlyLongLived;
+}
+
 function choosePrimaryTrigger(input: {
   noComment: boolean;
   longActive: boolean;
@@ -476,12 +491,14 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    const rawLongActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
       runCountLastSixHours >= thresholds.highChurnSixHours ||
       assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
+    const longActive = rawLongActive &&
+      !(isDeliberateLongLivedChatMirror(sourceIssue) && !noComment && !highChurn);
     const trigger = choosePrimaryTrigger({ noComment, longActive, highChurn });
     if (!trigger) return null;
 
