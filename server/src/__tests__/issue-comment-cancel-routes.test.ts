@@ -8,6 +8,7 @@ const mockIssueService = vi.hoisted(() => ({
   getComment: vi.fn(),
   removeComment: vi.fn(),
   tombstoneComment: vi.fn(),
+  containComment: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -231,6 +232,16 @@ describe.sequential("issue comment cancel routes", () => {
       await options?.afterTombstone?.(deleted, "tx");
       return deleted;
     });
+    mockIssueService.containComment.mockImplementation(async (_commentId, input) => makeComment({
+      body: input.body,
+      metadata: input.metadata,
+      presentation: {
+        kind: "system_notice",
+        tone: "danger",
+        title: "Comment quarantined",
+        detailsDefaultOpen: false,
+      },
+    }));
     mockAccessService.canUser.mockResolvedValue(false);
     mockAccessService.hasPermission.mockResolvedValue(false);
     mockFeedbackService.listIssueVotesForUser.mockResolvedValue([]);
@@ -264,6 +275,71 @@ describe.sequential("issue comment cancel routes", () => {
     mockIssueReferenceService.deleteCommentSource.mockResolvedValue(undefined);
     mockIssueReferenceService.syncComment.mockResolvedValue(undefined);
     mockExternalObjectService.syncCommentSafely.mockResolvedValue(undefined);
+  });
+
+
+  it("allows board users to quarantine an already-published sensitive comment without storing the original body", async () => {
+    mockIssueService.getComment.mockResolvedValue(
+      makeComment({
+        body: "token=super-secret-value",
+        createdByRunId: "33333333-3333-4333-8333-333333333333",
+        createdAt: new Date("2026-04-11T14:58:00.000Z"),
+        updatedAt: new Date("2026-04-11T14:58:00.000Z"),
+      }),
+    );
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments/comment-1/contain")
+      .send({ reason: "Credential material was published in this comment" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.body).toContain("Security containment");
+    expect(res.body.body).not.toContain("super-secret-value");
+    expect(mockIssueService.containComment).toHaveBeenCalledWith(
+      "comment-1",
+      expect.objectContaining({
+        body: expect.stringContaining("Security containment"),
+        metadata: expect.objectContaining({
+          version: 1,
+          sections: expect.arrayContaining([
+            expect.objectContaining({
+              title: "Security containment",
+              rows: expect.arrayContaining([
+                expect.objectContaining({ type: "key_value", label: "commentId", value: "comment-1" }),
+                expect.objectContaining({ type: "key_value", label: "issueId", value: "11111111-1111-4111-8111-111111111111" }),
+                expect.objectContaining({ type: "key_value", label: "containedBy", value: "local-board" }),
+                expect.objectContaining({ type: "text", label: "reason", text: "Credential material was published in this comment" }),
+              ]),
+            }),
+          ]),
+        }),
+      }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.comment_contained",
+        details: expect.objectContaining({
+          commentId: "comment-1",
+          reason: "Credential material was published in this comment",
+          originalCreatedByRunId: "33333333-3333-4333-8333-333333333333",
+        }),
+      }),
+    );
+  });
+
+  it("rejects comment containment for agent actors", async () => {
+    const res = await request(await installActor(createApp(), {
+      type: "agent",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments/comment-1/contain")
+      .send({ reason: "Credential material was published in this comment" });
+
+    expect(res.status).toBe(403);
+    expect(mockIssueService.containComment).not.toHaveBeenCalled();
   });
 
   it("cancels a queued comment from its author and restores the deleted body", async () => {

@@ -221,6 +221,11 @@ const blockerHandoffDeclineSchema = z.object({
   wakeCommentId: z.string().uuid().optional(),
   reason: z.string().trim().max(2000).optional(),
 });
+const containIssueCommentSchema = z.object({
+  reason: z.string().trim().min(1).max(2000),
+});
+const CONTAINED_ISSUE_COMMENT_BODY =
+  "[Security containment: this published comment was quarantined by an authorised board user. The original body is no longer available through normal Paperclip surfaces.]";
 
 type ParsedExecutionState = NonNullable<ReturnType<typeof parseIssueExecutionState>>;
 type NormalizedExecutionPolicy = NonNullable<ReturnType<typeof normalizeIssueExecutionPolicy>>;
@@ -7721,6 +7726,82 @@ export function issueRoutes(
     }
     res.json(comment);
   });
+
+  router.post(
+    "/issues/:id/comments/:commentId/contain",
+    validate(containIssueCommentSchema),
+    async (req, res) => {
+      assertBoard(req);
+      const id = req.params.id as string;
+      const commentId = req.params.commentId as string;
+      const issue = await svc.getById(id);
+      if (!issue) {
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+      assertCompanyAccess(req, issue.companyId);
+
+      const comment = await svc.getComment(commentId);
+      if (!comment || comment.issueId !== id) {
+        res.status(404).json({ error: "Comment not found" });
+        return;
+      }
+
+      const actor = getActorInfo(req);
+      const containedAt = new Date().toISOString();
+      const contained = await svc.containComment(commentId, {
+        body: CONTAINED_ISSUE_COMMENT_BODY,
+        metadata: {
+          version: 1,
+          sourceRunId: null,
+          sections: [
+            {
+              title: "Security containment",
+              rows: [
+                { type: "key_value", label: "commentId", value: comment.id },
+                { type: "key_value", label: "issueId", value: issue.id },
+                { type: "key_value", label: "containedBy", value: actor.actorId },
+                { type: "key_value", label: "containedByType", value: actor.actorType },
+                { type: "key_value", label: "runId", value: actor.runId ?? "none" },
+                { type: "key_value", label: "containedAt", value: containedAt },
+                { type: "text", label: "reason", text: req.body.reason },
+              ],
+            },
+          ],
+        },
+      });
+      if (!contained) {
+        res.status(404).json({ error: "Comment not found" });
+        return;
+      }
+
+      await issueReferencesSvc.syncComment(contained.id);
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.comment_contained",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          commentId: contained.id,
+          identifier: issue.identifier,
+          issueTitle: issue.title,
+          reason: req.body.reason,
+          containedAt,
+          originalAuthorAgentId: comment.authorAgentId ?? null,
+          originalAuthorUserId: comment.authorUserId ?? null,
+          originalCreatedByRunId: comment.createdByRunId ?? null,
+          originalCreatedAt: comment.createdAt,
+        },
+      });
+
+      res.json(contained);
+    },
+  );
 
   router.delete("/issues/:id/comments/:commentId", async (req, res) => {
     const id = req.params.id as string;
