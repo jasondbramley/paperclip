@@ -854,6 +854,11 @@ export async function startServer(): Promise<StartedServer> {
         logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
       }
 
+      const contextUsage = await heartbeat.scanAgentContextUsage();
+      if (contextUsage.warningsCreated > 0 || contextUsage.preemptsCreated > 0) {
+        logger.warn({ ...contextUsage }, "startup agent context monitor created review work");
+      }
+
       const setupCleanup = await environmentCustomImages.cleanupExpiredSetupSessions();
       if (setupCleanup.timedOut > 0 || setupCleanup.failed > 0) {
         logger.warn({ ...setupCleanup }, "startup environment customImage setup cleanup changed sessions");
@@ -861,7 +866,6 @@ export async function startServer(): Promise<StartedServer> {
     })().catch((err) => {
       logger.error({ err }, "startup heartbeat recovery failed");
     });
-
     // Guard: only one reconcile chain may run at a time. Without this, if a chain
     // takes longer than the interval (30 s) the next tick fires another chain while
     // the first is still holding DB connections, causing pool exhaustion → API wedge.
@@ -968,7 +972,12 @@ export async function startServer(): Promise<StartedServer> {
             logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
           }
         })
-        .then(() => {
+        .then(async () => {
+          const contextUsage = await heartbeat.scanAgentContextUsage();
+          if (contextUsage.warningsCreated > 0 || contextUsage.preemptsCreated > 0) {
+            logger.warn({ ...contextUsage }, "periodic agent context monitor created review work");
+          }
+
           const elapsedMs = Date.now() - reconcileStartMs;
           if (elapsedMs > 10_000) {
             logger.warn({ elapsedMs }, "periodic heartbeat reconcile completed slowly");
