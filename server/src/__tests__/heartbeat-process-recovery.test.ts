@@ -4248,6 +4248,80 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeups).toHaveLength(2);
   });
 
+  it("does not re-enqueue productive continuation recovery for pinned live chat anchors", async () => {
+    const { agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    await db
+      .update(issues)
+      .set({
+        title: "[PIN OPEN] TICKETS ONLY live Teams chat anchor",
+        description: "Pinned chat anchor. Keep open by design.",
+      })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.successfulContinuationObserved).toBe(1);
+    expect(result.skipped).toBe(1);
+    expect(result.issueIds).toEqual([]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(0);
+
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(1);
+  });
+
+  it("does not escalate a pinned live chat anchor when a later comment supersedes the failed continuation run", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "adapter_failed",
+      runError: "Your access token could not be refreshed because your refresh token was already used.",
+    });
+    await db
+      .update(issues)
+      .set({
+        title: "[PIN OPEN] TICKETS ONLY live Teams chat anchor",
+        description: "Pinned chat anchor. Keep open by design.",
+      })
+      .where(eq(issues.id, issueId));
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
+    const commentCreatedAt = new Date((run?.createdAt?.getTime() ?? Date.now()) + 1_000);
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      body: "Routing recovery handled; no further action is needed on this pinned chat anchor.",
+      createdAt: commentCreatedAt,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(result.issueIds).toEqual([]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(0);
+
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(1);
+  });
+
   it("blocks stranded in-progress work after a productive continuation retry was already used", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
