@@ -269,6 +269,19 @@ type SuccessfulRunHandoffActivityRow = {
 type TaskWatchdogService = ReturnType<typeof taskWatchdogService>;
 type TaskWatchdogServiceFactory = typeof taskWatchdogService;
 
+function isPinnedLiveChatAnchorIssue(issue: { title: string; description?: string | null }) {
+  const title = issue.title.trim().toLowerCase();
+  const text = `${title}\n${issue.description ?? ""}`.toLowerCase();
+  const explicitlyPinned = title.startsWith("[pin open]") || /\bpin(?:ned)?\s+open\b/.test(text);
+  if (!explicitlyPinned) return false;
+  return (
+    /\bchat\s+mirror\b/.test(text) ||
+    /\bchat\s+anchor\b/.test(text) ||
+    /\blive\s+teams\s+chat\b/.test(text) ||
+    /\btickets\s+only\b/.test(text)
+  );
+}
+
 function applyCreateIssueStatusDefault(req: Request, res: Response, next: () => void) {
   if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
     next();
@@ -3944,6 +3957,18 @@ export function issueRoutes(
       updateFields,
       actorType: req.actor.type,
     });
+
+    if (outcome === "continued") {
+      const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id);
+      if (!activeRecoveryAction || (actionId && activeRecoveryAction.id !== actionId)) {
+        throw notFound("Active recovery action not found");
+      }
+      if (activeRecoveryAction.kind !== "missing_disposition" || !isPinnedLiveChatAnchorIssue(existing)) {
+        throw unprocessable(
+          "Continued recovery resolution is only allowed for missing-disposition recovery on explicitly pinned live chat anchors",
+        );
+      }
+    }
 
     const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
     const result = await db.transaction(async (tx) => {

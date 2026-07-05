@@ -1102,6 +1102,49 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
   });
 
+  it("rejects continued recovery resolution for ordinary missing-disposition issues", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:ordinary-issue",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const rejected = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "continued",
+        sourceIssueStatus: "in_progress",
+        resolutionNote: "Keep this ordinary issue in progress.",
+      })
+      .expect(422);
+
+    expect(rejected.body.error).toContain("explicitly pinned live chat anchors");
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "active",
+      outcome: null,
+      resolvedAt: null,
+    });
+  });
+
   it("rejects blocked recovery resolution when the source issue has no first-class blockers", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const recoveryActionSvc = issueRecoveryActionService(db);
