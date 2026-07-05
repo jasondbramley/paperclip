@@ -258,12 +258,39 @@ type ContinuationRetryClassification = {
   errorCode: string | null;
 };
 
+// ITO-2142: adapters do not always surface a structured transient errorCode for
+// stream disconnects or provider 5xx failures; fall back to matching the raw
+// error text so these still get transient-infra retries instead of a single
+// default attempt. Context-window overflows get exactly one fresh retry - if
+// the retry overflows again the normal streak escalation blocks the issue.
+const CONTEXT_OVERFLOW_FAILURE_TEXT_RE =
+  /(context window|adapter_failed.*context|maximum context length)/i;
+const STREAM_DISCONNECT_FAILURE_TEXT_RE =
+  /(stream disconnected before completion|response\.failed event received|transport error:\s*timeout|adapter_failed\s*[-\u2013]\s*stream\s+disconnected|HTTP[/ ]\s*5\d\d)/i;
+
 export function classifyContinuationFailure(latestRun: LatestIssueRun): ContinuationRetryClassification {
   const errorCode = readNonEmptyString(latestRun?.errorCode);
   if (errorCode && NON_RETRYABLE_CONTINUATION_ERROR_CODES.has(errorCode)) {
     return { kind: "non_retryable", maxAttempts: 0, baseBackoffMs: 0, errorCode };
   }
   if (errorCode && TRANSIENT_INFRA_CONTINUATION_ERROR_CODES.has(errorCode)) {
+    return {
+      kind: "transient_infra",
+      maxAttempts: CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS,
+      baseBackoffMs: CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS,
+      errorCode,
+    };
+  }
+  const errorText = readNonEmptyString(latestRun?.error);
+  if (errorText && CONTEXT_OVERFLOW_FAILURE_TEXT_RE.test(errorText)) {
+    return {
+      kind: "transient_infra",
+      maxAttempts: 1,
+      baseBackoffMs: CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS,
+      errorCode,
+    };
+  }
+  if (errorText && STREAM_DISCONNECT_FAILURE_TEXT_RE.test(errorText)) {
     return {
       kind: "transient_infra",
       maxAttempts: CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS,
