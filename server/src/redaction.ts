@@ -133,6 +133,26 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
   return sanitizeRecord(payload);
 }
 
+export function redactAdapterConfigForResponse(adapterConfig: Record<string, unknown> | null): Record<string, unknown> | null {
+  const sanitized = redactEventPayload(adapterConfig);
+  if (!sanitized || !isPlainObject(sanitized.env)) return sanitized;
+
+  const env: Record<string, unknown> = {};
+  for (const [key, binding] of Object.entries(sanitized.env)) {
+    if (isSecretRefBinding(binding)) {
+      env[key] = sanitizeValue(binding);
+      continue;
+    }
+    if (isPlainBinding(binding)) {
+      env[key] = { type: "plain", value: REDACTED_EVENT_VALUE };
+      continue;
+    }
+    env[key] = REDACTED_EVENT_VALUE;
+  }
+
+  return { ...sanitized, env };
+}
+
 export function redactSensitiveText(input: string): string {
   if (!maybeContainsSecretText(input)) return input;
   return redactCommandText(

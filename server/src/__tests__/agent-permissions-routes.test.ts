@@ -3,6 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
 import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 
 vi.mock("acpx/runtime", () => ({
   createAcpRuntime: vi.fn(),
@@ -49,6 +50,9 @@ const mockAgentService = vi.hoisted(() => ({
   updatePermissions: vi.fn(),
   getChainOfCommand: vi.fn(),
   resolveByReference: vi.fn(),
+  listConfigRevisions: vi.fn(),
+  getConfigRevision: vi.fn(),
+  rollbackConfigRevision: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -354,6 +358,9 @@ describe.sequential("agent permission routes", () => {
     });
     mockAgentService.update.mockResolvedValue(baseAgent);
     mockAgentService.updatePermissions.mockResolvedValue(baseAgent);
+    mockAgentService.listConfigRevisions.mockResolvedValue([]);
+    mockAgentService.getConfigRevision.mockResolvedValue(null);
+    mockAgentService.rollbackConfigRevision.mockResolvedValue(null);
     mockAccessService.canUser.mockResolvedValue(true);
     mockAccessService.decide.mockImplementation(async (input: { action?: string }) => {
       const allowed = Boolean(await mockAccessService.canUser());
@@ -495,6 +502,109 @@ describe.sequential("agent permission routes", () => {
         runtimeConfig: {},
       }),
     ]);
+  });
+
+  it("redacts adapter env values from privileged agent detail responses", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: {
+        model: "gpt-5.5",
+        env: {
+          SAFE_LABEL: { type: "plain", value: "plain-value" },
+          API_TOKEN: { type: "plain", value: "token-value" },
+          GRAPH_SECRET: {
+            type: "secret_ref",
+            secretId: "33333333-3333-4333-8333-333333333333",
+            version: "latest",
+          },
+        },
+      },
+    });
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}`));
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.env).toEqual({
+      SAFE_LABEL: { type: "plain", value: REDACTED_EVENT_VALUE },
+      API_TOKEN: { type: "plain", value: REDACTED_EVENT_VALUE },
+      GRAPH_SECRET: {
+        type: "secret_ref",
+        secretId: "33333333-3333-4333-8333-333333333333",
+        version: "latest",
+      },
+    });
+    expect(JSON.stringify(res.body)).not.toContain("plain-value");
+    expect(JSON.stringify(res.body)).not.toContain("token-value");
+  });
+
+  it("redacts adapter env values from privileged company agent list responses", async () => {
+    mockAgentService.list.mockResolvedValue([{
+      ...baseAgent,
+      adapterConfig: {
+        env: {
+          SAFE_LABEL: { type: "plain", value: "plain-value" },
+          LEGACY_RAW_VALUE: "raw-value",
+        },
+      },
+    }]);
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/${companyId}/agents`));
+
+    expect(res.status).toBe(200);
+    expect(res.body[0].adapterConfig.env).toEqual({
+      SAFE_LABEL: { type: "plain", value: REDACTED_EVENT_VALUE },
+      LEGACY_RAW_VALUE: REDACTED_EVENT_VALUE,
+    });
+    expect(JSON.stringify(res.body)).not.toContain("plain-value");
+    expect(JSON.stringify(res.body)).not.toContain("raw-value");
+  });
+
+  it("redacts adapter env values from config revision rollback responses", async () => {
+    mockAgentService.rollbackConfigRevision.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: {
+        env: {
+          SAFE_LABEL: { type: "plain", value: "plain-value" },
+          LEGACY_RAW_VALUE: "raw-value",
+        },
+      },
+    });
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post(`/api/agents/${agentId}/config-revisions/revision-1/rollback`).send({}),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.env).toEqual({
+      SAFE_LABEL: { type: "plain", value: REDACTED_EVENT_VALUE },
+      LEGACY_RAW_VALUE: REDACTED_EVENT_VALUE,
+    });
+    expect(JSON.stringify(res.body)).not.toContain("plain-value");
+    expect(JSON.stringify(res.body)).not.toContain("raw-value");
   });
 
   it("blocks agent updates for authenticated company members without agent admin permission", async () => {
