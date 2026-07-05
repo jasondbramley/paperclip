@@ -110,6 +110,25 @@ describe("issue validators", () => {
     ).toBe(false);
   });
 
+  it("allows continued recovery resolutions to keep a source issue in progress", () => {
+    expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "continued",
+        sourceIssueStatus: "in_progress",
+      }),
+    ).toMatchObject({
+      outcome: "continued",
+      sourceIssueStatus: "in_progress",
+    });
+
+    expect(
+      resolveIssueRecoveryActionSchema.safeParse({
+        outcome: "continued",
+        sourceIssueStatus: "done",
+      }).success,
+    ).toBe(false);
+  });
+
   it("allows cancelled recovery resolutions to atomically restore the source issue status", () => {
     expect(
       resolveIssueRecoveryActionSchema.parse({

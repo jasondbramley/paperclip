@@ -277,6 +277,7 @@ export type IssueRecoveryActionReadModel = z.infer<typeof issueRecoveryActionRea
 
 const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "restored",
+  "continued",
   "false_positive",
   "blocked",
   "cancelled",
@@ -285,9 +286,20 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
 export const resolveIssueRecoveryActionSchema = z.object({
   actionId: z.string().uuid().optional(),
   outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
-  sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
+  sourceIssueStatus: z.enum(["todo", "done", "in_progress", "in_review", "blocked"]),
   resolutionNote: multilineTextSchema.optional().nullable(),
 }).strict().superRefine((value, ctx) => {
+  if (value.outcome === "continued") {
+    if (value.sourceIssueStatus !== "in_progress") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Continued recovery actions must keep the source issue in_progress",
+        path: ["sourceIssueStatus"],
+      });
+    }
+    return;
+  }
+
   if (value.outcome === "restored") {
     if (
       value.sourceIssueStatus !== "todo" &&

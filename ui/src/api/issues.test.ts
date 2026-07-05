@@ -95,4 +95,21 @@ describe("issuesApi.list", () => {
       },
     );
   });
+
+  it("posts continued recovery action resolution without closing the source issue", async () => {
+    await issuesApi.resolveRecoveryAction("issue-1", {
+      actionId: "00000000-0000-0000-0000-0000000000aa",
+      outcome: "continued",
+      sourceIssueStatus: "in_progress",
+    });
+
+    expect(mockApi.post).toHaveBeenCalledWith(
+      "/issues/issue-1/recovery-actions/resolve",
+      {
+        actionId: "00000000-0000-0000-0000-0000000000aa",
+        outcome: "continued",
+        sourceIssueStatus: "in_progress",
+      },
+    );
+  });
 });

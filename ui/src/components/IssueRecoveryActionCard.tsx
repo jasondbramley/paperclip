@@ -26,6 +26,7 @@ export const deriveRecoveryCardState = deriveRecoveryDisplayState;
 
 export type RecoveryResolveOutcome =
   | "todo"
+  | "continued"
   | "done"
   | "in_review"
   | "false_positive_done"
@@ -129,6 +130,7 @@ const STATE_TONE: Record<RecoveryCardCardState, {
 
 const OUTCOME_LABEL: Record<IssueRecoveryActionOutcome, string> = {
   restored: "restored",
+  continued: "continued",
   delegated: "delegated to follow-up",
   false_positive: "false positive",
   blocked: "blocked",
@@ -304,6 +306,11 @@ const RESOLVE_OPTIONS: Array<{
     outcome: "todo",
     label: "Try again",
     description: "Dismiss recovery and return the source task to todo.",
+  },
+  {
+    outcome: "continued",
+    label: "Keep in progress",
+    description: "Resolve recovery by recording that the issue should stay open.",
   },
   {
     outcome: "done",
