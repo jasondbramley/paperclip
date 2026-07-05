@@ -12524,13 +12524,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
+        // ITO-2552: comment-reopen wakes additionally require an explicit request
+        // (reopen/resume/follow-up flag) so an ordinary trailing comment cannot
+        // silently drag a terminal issue back to todo.
+        const explicitDeferredReopen =
+          deferredContextSeed.resumeIntent === true ||
+          deferredContextSeed.followUpRequested === true ||
+          deferredContextSeed.explicitReopenRequested === true;
         const shouldReopenDeferredCommentWake =
           deferredCommentIds.length > 0 &&
           !deferredCommentWakeIsSelfAuthored &&
           (issue.status === "done" || issue.status === "cancelled") &&
           (
             deferred.requestedByActorType === "user" ||
-            deferredWakeReason === "issue_reopened_via_comment"
+            (deferredWakeReason === "issue_reopened_via_comment" && explicitDeferredReopen)
           );
         let reopenedActivity: LogActivityInput | null = null;
 
