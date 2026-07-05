@@ -2711,7 +2711,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     issueContext: Awaited<ReturnType<typeof getIssueExecutionContext>> | null,
   ) {
     // TODO(ITO-2142 follow-up): restore env lookup once routines.env + routineRuns.routineRevisionId
-    // schema columns and RoutineRevisionSnapshotRoutineV1.env property land in jasondbramley/paperclip
+    // schema columns and RoutineRevisionSnapshotRoutineV1.env property land in IT-Outcomes/paperclip
     // master. Currently those exist in upstream paperclipai but not here.
     void companyId;
     if (!issueContext || issueContext.originKind !== "routine_execution" || !issueContext.originId) {
