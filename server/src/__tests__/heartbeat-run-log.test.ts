@@ -38,4 +38,20 @@ describe("compactRunLogChunk", () => {
     expect(compacted).not.toContain("paperclip-json-secret");
     expect(compacted).not.toContain("paperclip-flag-secret");
   });
+
+  it("redacts Paperclip credential shapes before persisting run-log chunks", () => {
+    const jwtPlaceholder = "placeholderHeader.placeholderPayload.placeholderSignature";
+    const chunk = [
+      "Authorization: Bearer placeholder-bearer-token",
+      "export PAPERCLIP_API_KEY='placeholder-paperclip-key'",
+      `session=${jwtPlaceholder}`,
+    ].join("\n");
+
+    const compacted = compactRunLogChunk(chunk);
+
+    expect(compacted).toContain("***REDACTED***");
+    expect(compacted).not.toContain("placeholder-bearer-token");
+    expect(compacted).not.toContain("placeholder-paperclip-key");
+    expect(compacted).not.toContain(jwtPlaceholder);
+  });
 });
