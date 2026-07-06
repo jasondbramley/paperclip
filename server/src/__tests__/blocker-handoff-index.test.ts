@@ -53,7 +53,13 @@ const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 vi.mock("../services/index.js", () => ({
   accessService: () => ({
     canUser: vi.fn(),
-    hasPermission: vi.fn(),
+    decide: vi.fn(async (input: { action?: string }) => ({
+      allowed: true,
+      action: input.action,
+      reason: "allow_test",
+      explanation: "Allowed by test mock.",
+    })),
+    hasPermission: vi.fn(async () => false),
   }),
   agentService: () => ({
     getById: vi.fn(),
@@ -79,6 +85,20 @@ vi.mock("../services/index.js", () => ({
   }),
   ISSUE_LIST_DEFAULT_LIMIT: 500,
   ISSUE_LIST_MAX_LIMIT: 1000,
+  documentAnnotationService: () => ({
+    listForIssue: vi.fn(async () => []),
+  }),
+  environmentService: () => ({}),
+  instanceSettingsService: () => ({
+    get: vi.fn(async () => ({ id: "settings", general: {} })),
+    getExperimental: vi.fn(async () => ({})),
+    getGeneral: vi.fn(async () => ({})),
+    listCompanyIds: vi.fn(async () => ["company-1"]),
+  }),
+  issueThreadInteractionService: () => ({
+    expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
+    expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
+  }),
   issueApprovalService: () => ({}),
   issueRecoveryActionService: () => ({
     getActiveForIssue: vi.fn(async () => null),
@@ -109,6 +129,10 @@ vi.mock("../services/index.js", () => ({
   workProductService: () => ({
     listForIssue: vi.fn(async () => []),
   }),
+}));
+
+vi.mock("../services/plan-review-context.js", () => ({
+  buildPlanReviewContext: vi.fn(async () => null),
 }));
 
 async function createApp() {
