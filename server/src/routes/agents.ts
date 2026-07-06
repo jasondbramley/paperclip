@@ -566,15 +566,35 @@ export function agentRoutes(
 
   async function buildAgentDetail(
     agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
-    options?: { restricted?: boolean },
+    options?: { restricted?: boolean; viewerIsSelf?: boolean },
   ) {
     const [chainOfCommand, accessState] = await Promise.all([
       svc.getChainOfCommand(agent.id),
       buildAgentAccessState(agent),
     ]);
 
+    // Fork PR #17 redacts adapter/runtime secret VALUES from agent API responses
+    // so board members never receive raw secrets they should read via the secrets
+    // manager. Upstream #7530 (low-trust review containment) still requires two
+    // detail views to stay fully unredacted, and asserts this directly:
+    //   * an agent inspecting ITSELF — it owns and needs its own secrets
+    //     (low-trust-red-team-routes: "restricts low-trust self inspection
+    //     without changing standard-agent visibility"), and
+    //   * a board reviewer inspecting a LOW-TRUST/contained agent — the review
+    //     needs the contained agent's full configuration (agent-permissions-routes:
+    //     "keeps board agent detail unredacted for low-trust agents").
+    // So value redaction applies only to board views of standard (non-low-trust)
+    // agents; the restricted view (no config-read grant) still strips config
+    // entirely via redactForRestrictedAgentView.
+    const targetIsLowTrust = agent.permissions?.trustPreset === LOW_TRUST_REVIEW_PRESET;
+    const preserveSecretValues = options?.viewerIsSelf === true || targetIsLowTrust;
+
     return {
-      ...(options?.restricted ? redactForRestrictedAgentView(agent) : redactAgentResponse(agent)),
+      ...(options?.restricted
+        ? redactForRestrictedAgentView(agent)
+        : preserveSecretValues
+          ? agent
+          : redactAgentResponse(agent)),
       chainOfCommand,
       access: accessState,
     };
@@ -1981,7 +2001,9 @@ export function agentRoutes(
       });
       return;
     }
-    res.json(await buildAgentDetail(agent));
+    // /agents/me is always the agent inspecting itself: it owns its secrets, so
+    // its own detail is returned unredacted (upstream #7530 contract).
+    res.json(await buildAgentDetail(agent, { viewerIsSelf: true }));
   });
 
   router.get("/agents/me/inbox-lite", async (req, res) => {
@@ -2070,7 +2092,7 @@ export function agentRoutes(
       res.json(await buildAgentDetail(agent, { restricted: true }));
       return;
     }
-    res.json(await buildAgentDetail(agent));
+    res.json(await buildAgentDetail(agent, { viewerIsSelf: isSelf }));
   });
 
   router.get("/agents/:id/configuration", async (req, res) => {
