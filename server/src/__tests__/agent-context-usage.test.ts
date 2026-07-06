@@ -190,7 +190,10 @@ describeEmbeddedPostgres("agent context preempt retire/rebuild", () => {
     expect(preemptIssues[0]?.status).toBe("todo");
   });
 
-  it("retires and rebuilds during the quiet window while redistributing active tickets safely", async () => {
+  it("retires and rebuilds during the quiet window while redistributing active tickets safely (opt-in)", async () => {
+    const prev = process.env.AGENT_CONTEXT_AUTO_REBUILD;
+    process.env.AGENT_CONTEXT_AUTO_REBUILD = "1"; // ITO safeguard: auto-rebuild is opt-in; exercise the path explicitly
+    try {
     const seeded = await seedPreemptCandidate();
     const heartbeat = heartbeatService(db);
 
@@ -226,5 +229,33 @@ describeEmbeddedPostgres("agent context preempt retire/rebuild", () => {
       ticketsRedistributed: 1,
       reporteesUpdated: 1,
     });
+    } finally {
+      if (prev === undefined) delete process.env.AGENT_CONTEXT_AUTO_REBUILD;
+      else process.env.AGENT_CONTEXT_AUTO_REBUILD = prev;
+    }
+  });
+
+  it("does NOT auto-retire in the quiet window by default — review-work only (ITO safeguard)", async () => {
+    const prev = process.env.AGENT_CONTEXT_AUTO_REBUILD;
+    delete process.env.AGENT_CONTEXT_AUTO_REBUILD; // default OFF
+    try {
+      const seeded = await seedPreemptCandidate();
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.scanAgentContextUsage({
+        companyId: seeded.companyId,
+        now: new Date("2026-05-25T02:30:00Z"),
+      });
+
+      // preempt review issue is still raised, but the agent is NOT terminated and no rebuild runs
+      expect(result.preemptsCreated).toBe(1);
+      const [source] = await db.select().from(agents).where(eq(agents.id, seeded.agentId));
+      expect(source?.status).not.toBe("terminated");
+      const auditRows = await db.select().from(activityLog).where(eq(activityLog.action, "agent.retire_rebuild"));
+      expect(auditRows).toHaveLength(0);
+    } finally {
+      if (prev === undefined) delete process.env.AGENT_CONTEXT_AUTO_REBUILD;
+      else process.env.AGENT_CONTEXT_AUTO_REBUILD = prev;
+    }
   });
 });
