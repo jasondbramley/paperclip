@@ -187,7 +187,13 @@ function registerRouteMocks() {
       listIssueVotesForUser: vi.fn(async () => []),
       saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
     }),
-    goalService: () => ({}),
+    // The create-issue route resolves a company default goal when the request
+    // supplies neither goalId nor projectId (routes/issues.ts getDefaultCompanyGoal
+    // fallback). Provide the method so those paths don't crash; null => no default
+    // goal, matching the real service when none is configured.
+    goalService: () => ({
+      getDefaultCompanyGoal: vi.fn(async () => null),
+    }),
     heartbeatService: () => mockHeartbeatService,
     instanceSettingsService: () => ({
       get: vi.fn(async () => ({
