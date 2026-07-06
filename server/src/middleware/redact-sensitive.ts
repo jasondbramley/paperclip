@@ -13,6 +13,7 @@
 
 const SENSITIVE_KEYS = new Set<string>([
   "password",
+  "value", // ITO 2026-07-06: user-secret create body { definitionId, value } — redact plaintext on 4xx logging
   "currentpassword",
   "newpassword",
   "passwordconfirmation",

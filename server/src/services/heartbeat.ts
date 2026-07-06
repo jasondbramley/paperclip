@@ -10217,7 +10217,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (estimate.band === "preempt") {
         const result = await createAgentContextUsageIssue(agent, estimate, "preempt", now);
         if (result.created) preemptsCreated += 1;
-        if (estimate.quietWindow) {
+        // ITO safeguard (2026-07-06): auto retire/rebuild stays DISABLED until the agreed
+        // safeguard design ships (circuit-breaker + estimate-fix + cooldown). The June runaway
+        // retire/rebuild loop originated here. Opt-in only via AGENT_CONTEXT_AUTO_REBUILD=1;
+        // default OFF = review-work only, matching this feature's documented "creates review work" behaviour.
+        if (estimate.quietWindow && process.env.AGENT_CONTEXT_AUTO_REBUILD === "1") {
           await executeAgentRetireRebuild({
             agentId: agent.id,
             now,

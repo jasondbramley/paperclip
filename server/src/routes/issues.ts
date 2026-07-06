@@ -3595,7 +3595,9 @@ export function issueRoutes(
       issueWorkMode: issue.workMode,
       includeForIssueComment: wakeCommentId !== null,
     });
-    const blockerHandoffSuggestions = wakeComment && wakeComment.issueId === issue.id
+    // ITO (2026-07-06): when low-trust redaction is active, do NOT derive handoff suggestions
+    // from the raw quarantined comment body (matchedSignalPhrases would leak un-sanitised content).
+    const blockerHandoffSuggestions = wakeComment && wakeComment.issueId === issue.id && !redactLowTrust
       ? await svc.listBlockerHandoffSuggestions(issue.companyId, wakeComment.body, { limit: 5 })
       : [];
 

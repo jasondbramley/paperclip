@@ -3057,7 +3057,7 @@ export function agentRoutes(
       entityId: agent.id,
     });
 
-    res.json(agent);
+    res.json(redactAgentResponse(agent));
   });
 
   router.post("/agents/:id/approve", async (req, res) => {
