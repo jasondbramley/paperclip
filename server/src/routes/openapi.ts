@@ -698,6 +698,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/accept",
   "POST /api/issues/{id}/interactions/{interactionId}/reject",
   "POST /api/issues/{id}/interactions/{interactionId}/respond",
+  // Fork addition (ITO): comment containment asserts board actor (assertBoard).
+  "POST /api/issues/{id}/comments/{commentId}/contain",
 ]);
 
 const INSTANCE_ADMIN_OPERATIONS = new Set([
@@ -995,6 +997,24 @@ registry.registerPath({
     401: r.unauthorized,
     403: r.forbidden,
   },
+});
+
+// Fork addition (ITO): search the blocker handoff suggestion index. See the
+// "Fork additions (ITO)" note above the comment-containment route in the issues
+// section.
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/blocker-handoff-index/search",
+  tags: ["companies"],
+  summary: "Search the blocker handoff suggestion index",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      q: z.string(),
+      limit: z.string().optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -1713,6 +1733,25 @@ registry.registerPath({
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
+// ─── Fork additions (ITO) ─────────────────────────────────────────────────────
+// The routes below exist in the ITO fork's issues router (blocker-handoff
+// index/decline + published-comment containment) but are absent from upstream's
+// hand-maintained OpenAPI document. Registered here so the generated spec matches
+// the mounted routes exactly (openapi-routes.test.ts "covers the mounted server
+// routes exactly"). Body shapes mirror the fork-local zod validators in
+// server/src/routes/issues.ts.
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/comments/{commentId}/contain",
+  tags: ["issues"],
+  summary: "Contain (quarantine) a published issue comment",
+  request: {
+    params: z.object({ id: z.string(), commentId: z.string() }),
+    body: jsonBody(z.object({ reason: z.string().trim().min(1).max(2000) })),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
 registry.registerPath({
   method: "get",
   path: "/api/issues/{id}/approvals",
@@ -1741,6 +1780,26 @@ registry.registerPath({
   summary: "Unlink an approval from an issue",
   request: { params: z.object({ id: z.string(), approvalId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+// Fork addition (ITO): decline a suggested blocker handoff match. See the
+// "Fork additions (ITO)" note above the comment-containment route.
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{sourceIssueId}/blocker-handoff-suggestions/decline",
+  tags: ["issues"],
+  summary: "Decline a suggested blocker handoff match",
+  request: {
+    params: z.object({ sourceIssueId: z.string() }),
+    body: jsonBody(
+      z.object({
+        matchedIssueId: z.string().uuid(),
+        wakeCommentId: z.string().uuid().optional(),
+        reason: z.string().trim().max(2000).optional(),
+      }),
+    ),
+  },
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
 });
 
 registry.registerPath({
