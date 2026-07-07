@@ -5,9 +5,13 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
+  agentWakeupRequests,
   activityLog,
   companies,
   createDb,
+  environmentLeases,
+  environments,
+  heartbeatRuns,
   issueComments,
   issueRecoveryActions,
   issueRelations,
@@ -130,7 +134,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   afterEach(async () => {
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
+    await db.delete(environmentLeases);
     await db.delete(activityLog);
+    await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
+    await db.delete(environments);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -189,6 +197,24 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
     const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     return { companyId, managerId, coderId, sourceIssueId, prefix, sourceIssue: sourceIssue! };
+  }
+
+  async function seedHeartbeatRun(input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    issueId?: string;
+    status?: string;
+  }) {
+    await db.insert(heartbeatRuns).values({
+      id: input.runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "manual",
+      status: input.status ?? "running",
+      startedAt: new Date("2026-05-13T18:00:00.000Z"),
+      contextSnapshot: input.issueId ? { issueId: input.issueId } : undefined,
+    });
   }
 
   function createApp(actor: any = { type: "board", source: "local_implicit" }) {
@@ -545,28 +571,24 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     );
   });
 
-  it("resolves a stale recovery action while keeping a live chat anchor in progress", async () => {
+  it("resolves an active recovery action by returning the source issue to todo", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
-      .set({
-        title: "[PIN OPEN] TICKETS ONLY live Teams chat anchor",
-        description: "Pinned chat anchor. Keep open by design.",
-        status: "in_progress",
-      })
+      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
       .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
       companyId,
       sourceIssueId,
-      kind: "missing_disposition",
+      kind: "issue_graph_liveness",
       ownerType: "agent",
       ownerAgentId: managerId,
-      cause: "successful_run_missing_issue_disposition",
-      fingerprint: "missing-disposition:live-anchor",
-      evidence: { sourceRunId: "run-1" },
-      nextAction: "Choose a valid issue disposition.",
-      wakePolicy: { type: "wake_owner" },
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:try-again",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
     });
     const app = createApp();
 
@@ -574,107 +596,251 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
       .send({
         actionId: action.id,
-        outcome: "continued",
-        sourceIssueStatus: "in_progress",
-        resolutionNote: "Pinned chat anchor remains live; no actionable inbound comment is pending.",
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+        resolutionNote: "Try the source issue again.",
       })
       .expect(200);
 
     expect(resolved.body.issue).toMatchObject({
       id: sourceIssueId,
-      status: "in_progress",
+      status: "todo",
       activeRecoveryAction: null,
     });
     expect(resolved.body.recoveryAction).toMatchObject({
       id: action.id,
       status: "resolved",
-      outcome: "continued",
-      resolutionNote: "Pinned chat anchor remains live; no actionable inbound comment is pending.",
+      outcome: "restored",
+      resolutionNote: "Try the source issue again.",
     });
     expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
   });
 
-  it("resolves stranded recovery while keeping a pinned live chat anchor in progress", async () => {
+  it("marks a recovery action stale when a blocked source issue is manually moved to todo", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
-      .set({
-        title: "[PIN OPEN] Coding Agent chat mirror",
-        description: "Pinned chat mirror. DO NOT CLOSE while waiting for the next Teams comment.",
-        status: "in_progress",
-      })
+      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
       .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
       companyId,
       sourceIssueId,
-      kind: "stranded_assigned_issue",
+      kind: "issue_graph_liveness",
       ownerType: "agent",
       ownerAgentId: managerId,
-      cause: "stranded_assigned_issue",
-      fingerprint: "stranded-assigned:live-anchor",
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:manual-restore",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+    const app = createApp();
+
+    const patched = await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "todo" })
+      .expect(200);
+
+    expect(patched.body).toMatchObject({
+      id: sourceIssueId,
+      status: "todo",
+      activeRecoveryAction: null,
+    });
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "cancelled",
+      outcome: "cancelled",
+      resolutionNote: "Recovery action became stale because the source issue was manually moved from blocked to todo.",
+    });
+    expect(actionRow?.resolvedAt).toBeTruthy();
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+
+    const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+    expect(detail.body.activeRecoveryAction).toBeNull();
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    expect(activityRows.map((row) => row.action)).toEqual(
+      expect.arrayContaining(["issue.updated", "issue.recovery_action_resolved"]),
+    );
+    expect(activityRows.find((row) => row.action === "issue.recovery_action_resolved")?.details).toMatchObject({
+      source: "source_revalidation",
+      trigger: "issue_update",
+    });
+  });
+
+  it("folds stale recovery during read projection after the source issue reaches done", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:done-projection",
       evidence: { latestIssueStatus: "in_progress" },
       nextAction: "Restore a live execution path.",
-      wakePolicy: { type: "wake_owner" },
+      wakePolicy: { type: "manual" },
     });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssueId));
     const app = createApp();
 
-    const resolved = await request(app)
-      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
-      .send({
-        actionId: action.id,
-        outcome: "continued",
-        sourceIssueStatus: "in_progress",
-        resolutionNote: "Pinned chat mirror remains live awaiting the next Teams comment.",
-      })
-      .expect(200);
+    const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
 
-    expect(resolved.body.issue).toMatchObject({
+    expect(detail.body).toMatchObject({
       id: sourceIssueId,
-      status: "in_progress",
+      status: "done",
       activeRecoveryAction: null,
     });
-    expect(resolved.body.recoveryAction).toMatchObject({
-      id: action.id,
-      status: "resolved",
-      outcome: "continued",
-      resolutionNote: "Pinned chat mirror remains live awaiting the next Teams comment.",
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "cancelled",
+      outcome: "cancelled",
+      resolutionNote: "Recovery action became stale because the source issue reached done.",
     });
-    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    expect(actionRow?.resolvedAt).toBeTruthy();
+
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    expect(activityRows.find((row) => row.action === "issue.recovery_action_resolved")?.details).toMatchObject({
+      source: "source_revalidation",
+      trigger: "read_projection",
+      recoveryActionId: action.id,
+    });
   });
 
-  it("rejects continued recovery resolution for ordinary missing-disposition issues", async () => {
+  it("keeps active recovery visible when a plain comment does not create a live path", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: null, assigneeUserId: "board-user" })
+      .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
       companyId,
       sourceIssueId,
-      kind: "missing_disposition",
+      kind: "issue_graph_liveness",
       ownerType: "agent",
       ownerAgentId: managerId,
-      cause: "successful_run_missing_issue_disposition",
-      fingerprint: "missing-disposition:ordinary-issue",
-      evidence: { sourceRunId: "run-1" },
-      nextAction: "Choose a valid issue disposition.",
-      wakePolicy: { type: "wake_owner" },
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:plain-comment",
+      evidence: { latestIssueStatus: "in_progress" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
     });
     const app = createApp();
 
-    const rejected = await request(app)
-      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
-      .send({
-        actionId: action.id,
-        outcome: "continued",
-        sourceIssueStatus: "in_progress",
-        resolutionNote: "Keep this ordinary issue in progress.",
-      })
-      .expect(422);
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/comments`)
+      .send({ body: "I am looking at this, but not changing the disposition." })
+      .expect(201);
 
-    expect(rejected.body.error).toContain("explicitly pinned live chat anchors");
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: action.id,
+      status: "active",
+    });
+    const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+    expect(detail.body.activeRecoveryAction).toMatchObject({ id: action.id });
+  });
+
+  it("folds stale recovery when a structured resume comment restores todo dispatch", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:resume-comment",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+    const app = createApp();
+
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/comments`)
+      .send({ body: "Resume this now.", resume: true })
+      .expect(201);
 
     const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
-    expect(sourceIssue?.status).toBe("in_progress");
+    expect(sourceIssue?.status).toBe("todo");
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "cancelled",
+      outcome: "cancelled",
+      resolutionNote: "Recovery action became stale because the source issue was manually moved from blocked to todo.",
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
 
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    expect(activityRows.find((row) => row.action === "issue.recovery_action_resolved")?.details).toMatchObject({
+      source: "source_revalidation",
+      trigger: "comment",
+      recoveryActionId: action.id,
+    });
+  });
+
+  it("rejects peer-agent source issue updates that would hide another owner's recovery action", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:peer-status-update",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+    const app = createApp({
+      type: "agent",
+      agentId: coderId,
+      companyId,
+      runId: randomUUID(),
+      source: "agent_jwt",
+    });
+
+    await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "todo" })
+      .expect(403);
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue?.status).toBe("blocked");
     const [actionRow] = await db
       .select()
       .from(issueRecoveryActions)
@@ -686,38 +852,45 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
-  it("rejects continued stranded recovery resolution for ordinary issues", async () => {
-    const { companyId, managerId, sourceIssueId } = await seedCompany();
+  it("rejects peer-agent recovery action resolution on a board-owned source issue", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
       companyId,
       sourceIssueId,
-      kind: "stranded_assigned_issue",
+      kind: "issue_graph_liveness",
       ownerType: "agent",
       ownerAgentId: managerId,
-      cause: "stranded_assigned_issue",
-      fingerprint: "stranded-assigned:ordinary-issue",
-      evidence: { latestIssueStatus: "in_progress" },
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:peer-resolution",
+      evidence: { latestIssueStatus: "blocked" },
       nextAction: "Restore a live execution path.",
-      wakePolicy: { type: "wake_owner" },
+      wakePolicy: { type: "manual" },
     });
-    const app = createApp();
+    const app = createApp({
+      type: "agent",
+      agentId: coderId,
+      companyId,
+      runId: randomUUID(),
+      source: "agent_jwt",
+    });
 
-    const rejected = await request(app)
+    await request(app)
       .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
       .send({
         actionId: action.id,
-        outcome: "continued",
-        sourceIssueStatus: "in_progress",
-        resolutionNote: "Keep this ordinary issue in progress.",
+        outcome: "restored",
+        sourceIssueStatus: "done",
+        resolutionNote: "Peer agent should not be able to clear this recovery.",
       })
-      .expect(422);
-
-    expect(rejected.body.error).toContain("explicitly pinned live chat anchors");
+      .expect(403);
 
     const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
-    expect(sourceIssue?.status).toBe("in_progress");
-
+    expect(sourceIssue?.status).toBe("blocked");
     const [actionRow] = await db
       .select()
       .from(issueRecoveryActions)
@@ -726,6 +899,62 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       status: "active",
       outcome: null,
       resolvedAt: null,
+    });
+  });
+
+  it("allows the named recovery owner to resolve a board-owned source recovery action", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:owner-resolution",
+      evidence: { latestIssueStatus: "blocked" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "manual" },
+    });
+    const runId = randomUUID();
+    const app = createApp({
+      type: "agent",
+      agentId: managerId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+    await seedHeartbeatRun({
+      companyId,
+      agentId: managerId,
+      runId,
+      issueId: sourceIssueId,
+    });
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "done",
+        resolutionNote: "Recovery owner verified the work was intentionally completed.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "done",
+      activeRecoveryAction: null,
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "restored",
     });
   });
 
@@ -948,4 +1177,188 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
   });
+  it("resolves a stale recovery action while keeping a live chat anchor in progress", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({
+        title: "[PIN OPEN] TICKETS ONLY live Teams chat anchor",
+        description: "Pinned chat anchor. Keep open by design.",
+        status: "in_progress",
+      })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:live-anchor",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "continued",
+        sourceIssueStatus: "in_progress",
+        resolutionNote: "Pinned chat anchor remains live; no actionable inbound comment is pending.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "in_progress",
+      activeRecoveryAction: null,
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "continued",
+      resolutionNote: "Pinned chat anchor remains live; no actionable inbound comment is pending.",
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  it("resolves stranded recovery while keeping a pinned live chat anchor in progress", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({
+        title: "[PIN OPEN] Coding Agent chat mirror",
+        description: "Pinned chat mirror. DO NOT CLOSE while waiting for the next Teams comment.",
+        status: "in_progress",
+      })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded-assigned:live-anchor",
+      evidence: { latestIssueStatus: "in_progress" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "continued",
+        sourceIssueStatus: "in_progress",
+        resolutionNote: "Pinned chat mirror remains live awaiting the next Teams comment.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "in_progress",
+      activeRecoveryAction: null,
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "continued",
+      resolutionNote: "Pinned chat mirror remains live awaiting the next Teams comment.",
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  it("rejects continued recovery resolution for ordinary missing-disposition issues", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "missing-disposition:ordinary-issue",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const rejected = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "continued",
+        sourceIssueStatus: "in_progress",
+        resolutionNote: "Keep this ordinary issue in progress.",
+      })
+      .expect(422);
+
+    expect(rejected.body.error).toContain("explicitly pinned live chat anchors");
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "active",
+      outcome: null,
+      resolvedAt: null,
+    });
+  });
+
+  it("rejects continued stranded recovery resolution for ordinary issues", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded-assigned:ordinary-issue",
+      evidence: { latestIssueStatus: "in_progress" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const rejected = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "continued",
+        sourceIssueStatus: "in_progress",
+        resolutionNote: "Keep this ordinary issue in progress.",
+      })
+      .expect(422);
+
+    expect(rejected.body.error).toContain("explicitly pinned live chat anchors");
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "active",
+      outcome: null,
+      resolvedAt: null,
+    });
+  });
+
 });

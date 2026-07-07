@@ -55,6 +55,7 @@ const mockAgentService = vi.hoisted(() => ({
 
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(),
+  decide: vi.fn(),
   hasPermission: vi.fn(),
   getMembership: vi.fn(),
   ensureMembership: vi.fn(),
@@ -306,6 +307,7 @@ describe.sequential("agent permission routes", () => {
     mockAgentService.getChainOfCommand.mockReset();
     mockAgentService.resolveByReference.mockReset();
     mockAccessService.canUser.mockReset();
+    mockAccessService.decide.mockReset();
     mockAccessService.hasPermission.mockReset();
     mockAccessService.getMembership.mockReset();
     mockAccessService.ensureMembership.mockReset();
@@ -349,6 +351,14 @@ describe.sequential("agent permission routes", () => {
     mockAgentService.getConfigRevision.mockResolvedValue(null);
     mockAgentService.rollbackConfigRevision.mockResolvedValue(null);
     mockAccessService.canUser.mockResolvedValue(true);
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => {
+      const allowed = Boolean(await mockAccessService.canUser());
+      return {
+        allowed,
+        reason: allowed ? "allow_explicit_grant" : "deny_missing_grant",
+        explanation: allowed ? "Allowed by test grant" : `Missing test grant for ${input.action ?? "action"}`,
+      };
+    });
     mockAccessService.hasPermission.mockResolvedValue(false);
     mockAccessService.getMembership.mockResolvedValue({
       id: "membership-1",
@@ -1516,6 +1526,24 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(200);
     expect(res.body.access.canAssignTasks).toBe(true);
     expect(res.body.access.taskAssignSource).toBe("explicit_grant");
+  }, 15_000);
+
+  it("reports simple-mode task assignment as enabled for active company agent members", async () => {
+    mockAccessService.listPrincipalGrants.mockResolvedValue([]);
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}`));
+
+    expect(res.status).toBe(200);
+    expect(res.body.access.canAssignTasks).toBe(true);
+    expect(res.body.access.taskAssignSource).toBe("simple_default");
   }, 15_000);
 
   it("keeps task assignment enabled when agent creation privilege is enabled", async () => {
