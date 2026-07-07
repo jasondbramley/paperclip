@@ -55,6 +55,8 @@ describeEmbeddedPostgres("productivity review service", () => {
     startedAt?: Date;
     parentId?: string | null;
     originKind?: string;
+    title?: string;
+    description?: string;
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -97,7 +99,8 @@ describeEmbeddedPostgres("productivity review service", () => {
     await db.insert(issues).values({
       id: issueId,
       companyId,
-      title: "Implement data import",
+      title: opts?.title ?? "Implement data import",
+      description: opts?.description ?? null,
       status: opts?.status ?? "in_progress",
       priority: "medium",
       assigneeAgentId: coderId,
@@ -335,6 +338,22 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(1);
     expect(result.creationCapped).toBe(0);
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(4);
+  });
+
+  it("does not create duration-only reviews for deliberate long-lived chat mirrors", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const chatMirror = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      title: "CEO — Ross — chat mirror (post-rebuild conversation ticket)",
+      description: "Long-lived conversation ticket for the CEO — Ross Teams chat. Used by chat-bridge daemon to mirror messages. DO NOT CLOSE.",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: chatMirror.companyId });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(chatMirror.companyId)).toHaveLength(0);
   });
 
   it("creates a long-active review without enabling a continuation hold", async () => {
