@@ -52,6 +52,9 @@ const mockIssueService = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
 vi.mock("../services/index.js", () => ({
+  clampIssueListLimit: () => ({}),
+  companySearchService: () => ({}),
+  issueThreadInteractionService: () => ({}),
   accessService: () => ({
     canUser: vi.fn(),
     hasPermission: vi.fn(),
