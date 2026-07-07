@@ -3608,7 +3608,12 @@ export function issueService(db: Db) {
         `);
       }
       if (filters?.status) {
-        const statuses = filters.status.split(",").map((s) => s.trim());
+        // Accept both comma-string and repeated query params (?status=a&status=b
+        // parses as an array) — agents send repeated params (ITO hop-2 fix).
+        const rawStatus = filters.status;
+        const statuses = (Array.isArray(rawStatus) ? rawStatus : String(rawStatus).split(","))
+          .map((s) => String(s).trim())
+          .filter(Boolean);
         conditions.push(statuses.length === 1 ? eq(issues.status, statuses[0]) : inArray(issues.status, statuses));
       }
       if (filters?.assigneeAgentId) {
