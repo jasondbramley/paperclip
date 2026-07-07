@@ -101,7 +101,7 @@ describeEmbeddedPostgres("heartbeat list", () => {
     }
   });
 
-  it("returns small result json payloads unchanged from getRun", async () => {
+  it("summarizes small result json payloads from getRun without raw output bodies", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
@@ -133,19 +133,25 @@ describeEmbeddedPostgres("heartbeat list", () => {
       status: "succeeded",
       resultJson: {
         summary: "done",
+        stdout: "synthetic-sensitive-stdout-marker",
+        stderr: "synthetic-sensitive-stderr-marker",
         structured: { ok: true },
       },
+      stdoutExcerpt: "synthetic-sensitive-stdout-excerpt",
+      stderrExcerpt: "synthetic-sensitive-stderr-excerpt",
     });
 
     const run = await heartbeatService(db).getRun(runId);
 
     expect(run?.resultJson).toEqual({
       summary: "done",
-      structured: { ok: true },
     });
+    expect(run?.stdoutExcerpt).toBeNull();
+    expect(run?.stderrExcerpt).toBeNull();
+    expect(JSON.stringify(run)).not.toContain("synthetic-sensitive");
   });
 
-  it("bounds oversized legacy result json payloads on getRun", async () => {
+  it("redacts output bodies from oversized legacy result json payloads on getRun", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
@@ -193,13 +199,89 @@ describeEmbeddedPostgres("heartbeat list", () => {
 
     expect(result).toMatchObject({
       summary: "completed",
-      truncated: true,
-      truncationReason: "oversized_result_json",
-      stdoutTruncated: true,
     });
-    expect(typeof result?.stdout).toBe("string");
-    expect((result?.stdout as string).length).toBeLessThan(oversizedStdout.length);
+    expect(result).not.toHaveProperty("stdout");
+    expect(result).not.toHaveProperty("stderr");
+    expect(result).not.toHaveProperty("truncated");
+    expect(JSON.stringify(run)).not.toContain(oversizedStdout.slice(0, 120));
     expect(result).not.toHaveProperty("nestedHuge");
+  });
+
+  it("quarantines security-redacted run detail, log, excerpts, and continuation context", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "succeeded",
+      logStore: "local_file",
+      logRef: "runs/security-redacted.ndjson",
+      logBytes: 1234,
+      logSha256: "safe-log-sha",
+      stdoutExcerpt: "synthetic-sensitive-stdout-excerpt",
+      stderrExcerpt: "synthetic-sensitive-stderr-excerpt",
+      contextSnapshot: {
+        issueId: randomUUID(),
+        wakeReason: "issue_assigned",
+        continuationSummary: "synthetic-sensitive-continuation-summary",
+      },
+      resultJson: {
+        securityRedacted: true,
+        redactionReason: "credential_exposure",
+        incidentTicket: "ITO-182",
+        summary: "synthetic-sensitive-summary",
+        stdout: "synthetic-sensitive-stdout-body",
+        stderr: "synthetic-sensitive-stderr-body",
+      },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.getRun(runId);
+    const log = await heartbeat.readLog(runId);
+    const serialized = JSON.stringify({ run, log });
+
+    expect(run?.resultJson).toMatchObject({
+      securityRedacted: true,
+      redactionReason: "credential_exposure",
+      incidentTicket: "ITO-182",
+      bodyRedacted: true,
+      stdoutRedacted: true,
+      stderrRedacted: true,
+    });
+    expect(run?.stdoutExcerpt).toBeNull();
+    expect(run?.stderrExcerpt).toBeNull();
+    expect(run?.contextSnapshot).toMatchObject({ wakeReason: "issue_assigned" });
+    expect(run?.contextSnapshot).not.toHaveProperty("continuationSummary");
+    expect(log).toMatchObject({
+      runId,
+      redacted: true,
+      logBytes: 1234,
+      logSha256: "safe-log-sha",
+    });
+    expect(serialized).not.toContain("synthetic-sensitive");
   });
 });
 

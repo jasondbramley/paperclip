@@ -24,6 +24,18 @@ function resolveMasterKeyFilePath() {
   return resolveDefaultSecretsKeyFilePath();
 }
 
+function resolveFallbackMasterKeyFilePaths(): string[] {
+  const fromEnv = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FALLBACK_FILES;
+  if (!fromEnv || fromEnv.trim().length === 0) return [];
+  return Array.from(new Set(
+    fromEnv
+      .split(path.delimiter)
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .map((value) => path.resolve(value)),
+  ));
+}
+
 function decodeMasterKey(raw: string): Buffer | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
@@ -78,6 +90,21 @@ function loadOrCreateMasterKey(): Buffer {
     // best effort
   }
   return generated;
+}
+
+function loadFallbackMasterKeys(): Buffer[] {
+  const keys: Buffer[] = [];
+  for (const keyPath of resolveFallbackMasterKeyFilePaths()) {
+    if (!existsSync(keyPath)) continue;
+    enforceKeyFilePermissionsBestEffort(keyPath);
+    const raw = readFileSync(keyPath, "utf8");
+    const decoded = decodeMasterKey(raw);
+    if (!decoded) {
+      throw badRequest(`Invalid fallback secrets master key at ${keyPath}`);
+    }
+    keys.push(decoded);
+  }
+  return keys;
 }
 
 function enforceKeyFilePermissionsBestEffort(keyPath: string) {
@@ -215,6 +242,21 @@ function decryptValue(masterKey: Buffer, material: LocalEncryptedMaterial): stri
   return plain.toString("utf8");
 }
 
+function decryptValueWithConfiguredKeys(material: LocalEncryptedMaterial): string {
+  const keys = [loadOrCreateMasterKey(), ...loadFallbackMasterKeys()];
+  for (const key of keys) {
+    try {
+      return decryptValue(key, material);
+    } catch {
+      // Try the next configured recovery key.
+    }
+  }
+  throw badRequest(
+    "Could not decrypt local_encrypted secret material with configured master key. " +
+      "Restore the original secrets/master.key or set PAPERCLIP_SECRETS_MASTER_KEY_FALLBACK_FILES to a previous key file.",
+  );
+}
+
 function asLocalEncryptedMaterial(value: StoredSecretVersionMaterial): LocalEncryptedMaterial {
   if (
     value &&
@@ -263,8 +305,7 @@ export const localEncryptedProvider: SecretProviderModule = {
     throw badRequest("local_encrypted does not support external reference secrets");
   },
   async resolveVersion(input) {
-    const masterKey = loadOrCreateMasterKey();
-    return decryptValue(masterKey, asLocalEncryptedMaterial(input.material));
+    return decryptValueWithConfiguredKeys(asLocalEncryptedMaterial(input.material));
   },
   async deleteOrArchive() {
     // Secret metadata deletion is handled in Paperclip DB; the local key is shared and must remain.

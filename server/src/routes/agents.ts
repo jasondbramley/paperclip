@@ -77,6 +77,10 @@ import { redactAdapterConfigForResponse, redactConfigForResponse, redactEventPay
 import { redactCurrentUserValue } from "../log-redaction.js";
 import { renderOrgChartSvg, renderOrgChartPng, type OrgNode, type OrgChartStyle, ORG_CHART_STYLES } from "./org-chart-svg.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import {
+  isHeartbeatRunSecurityRedacted,
+  redactHeartbeatRunResultJsonForResponse,
+} from "../services/heartbeat.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
 import {
   DEFAULT_ACPX_LOCAL_AGENT,
@@ -3288,6 +3292,20 @@ export function agentRoutes(
       return;
     }
     assertCompanyAccess(req, run.companyId);
+
+    if (isHeartbeatRunSecurityRedacted(run)) {
+      res.json([{
+        id: `${run.id}:security-redacted`,
+        runId: run.id,
+        seq: 0,
+        eventType: "security_redacted",
+        stream: "system",
+        message: "Run events are security redacted.",
+        payload: redactHeartbeatRunResultJsonForResponse(run.resultJson),
+        createdAt: run.updatedAt ?? run.finishedAt ?? run.createdAt,
+      }]);
+      return;
+    }
 
     const afterSeq = Number(req.query.afterSeq ?? 0);
     const limit = Number(req.query.limit ?? 200);

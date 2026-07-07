@@ -190,6 +190,66 @@ describeEmbeddedPostgres("agent context preempt retire/rebuild", () => {
     expect(preemptIssues[0]?.status).toBe("todo");
   });
 
+  it("ignores retired paused merged agents with heartbeat disabled", async () => {
+    const seeded = await seedPreemptCandidate();
+    const retiredAgentId = randomUUID();
+    const replacementAgentId = randomUUID();
+    await db.insert(agents).values([
+      {
+        id: replacementAgentId,
+        companyId: seeded.companyId,
+        name: "Replacement",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: retiredAgentId,
+        companyId: seeded.companyId,
+        name: "People Operations Officer (retired 2026-06-20 -- merged into CEO / Dispatcher)",
+        role: "operations",
+        status: "paused",
+        reportsTo: seeded.managerId,
+        capabilities: "x".repeat(400),
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {
+          heartbeat: {
+            enabled: false,
+            wakeOnDemand: false,
+            contextMonitor: {
+              contextWindowTokens: 100,
+              warningRatio: 0.8,
+              preemptRatio: 0.9,
+            },
+          },
+        },
+        permissions: {},
+        metadata: {
+          retiredAt: "2026-06-20T00:00:00.000Z",
+          replacementAgentId,
+        },
+      },
+    ]);
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanAgentContextUsage({
+      companyId: seeded.companyId,
+      now: new Date("2026-05-25T12:00:00Z"),
+    });
+
+    const preemptIssues = await db.select().from(issues).where(eq(issues.originKind, "agent_context_usage_preempt"));
+
+    expect(result.preemptsCreated).toBe(1);
+    expect(result.estimates.map((estimate) => estimate.agentId)).toContain(seeded.agentId);
+    expect(result.estimates.map((estimate) => estimate.agentId)).not.toContain(retiredAgentId);
+    expect(preemptIssues).toHaveLength(1);
+    expect(preemptIssues[0]?.originId).toBe(seeded.agentId);
+  });
+
   it("retires and rebuilds during the quiet window while redistributing active tickets safely", async () => {
     const seeded = await seedPreemptCandidate();
     const heartbeat = heartbeatService(db);
@@ -226,5 +286,18 @@ describeEmbeddedPostgres("agent context preempt retire/rebuild", () => {
       ticketsRedistributed: 1,
       reporteesUpdated: 1,
     });
+
+    const secondResult = await heartbeat.scanAgentContextUsage({
+      companyId: seeded.companyId,
+      now: new Date("2026-05-25T03:00:00Z"),
+    });
+    const replacementsAfterSecondScan = await db.select().from(agents).where(eq(agents.name, "Context Agent"));
+    const preemptIssuesAfterSecondScan = await db.select().from(issues).where(eq(issues.originKind, "agent_context_usage_preempt"));
+    const auditRowsAfterSecondScan = await db.select().from(activityLog).where(eq(activityLog.action, "agent.retire_rebuild"));
+
+    expect(secondResult.preemptsCreated).toBe(0);
+    expect(replacementsAfterSecondScan).toHaveLength(2);
+    expect(preemptIssuesAfterSecondScan).toHaveLength(1);
+    expect(auditRowsAfterSecondScan).toHaveLength(1);
   });
 });

@@ -69,9 +69,7 @@ import { secretService } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
-  HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS,
   HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS,
-  HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
   mergeHeartbeatRunResultJson,
 } from "./heartbeat-run-summary.js";
 import {
@@ -814,6 +812,12 @@ const heartbeatRunListContextColumns = {
 } as const;
 
 const heartbeatRunListResultColumns = {
+  resultSecurityRedacted: sql<string | null>`${heartbeatRuns.resultJson} ->> 'securityRedacted'`.as("resultSecurityRedacted"),
+  resultSecurityRedactedSnake: sql<string | null>`${heartbeatRuns.resultJson} ->> 'security_redacted'`.as("resultSecurityRedactedSnake"),
+  resultQuarantined: sql<string | null>`${heartbeatRuns.resultJson} ->> 'quarantined'`.as("resultQuarantined"),
+  resultQuarantine: sql<string | null>`${heartbeatRuns.resultJson} ->> 'quarantine'`.as("resultQuarantine"),
+  resultRedactionReason: sql<string | null>`coalesce(${heartbeatRuns.resultJson} ->> 'redactionReason', ${heartbeatRuns.resultJson} ->> 'securityRedactionReason', ${heartbeatRuns.resultJson} ->> 'quarantineReason')`.as("resultRedactionReason"),
+  resultIncidentTicket: sql<string | null>`coalesce(${heartbeatRuns.resultJson} ->> 'incidentTicket', ${heartbeatRuns.resultJson} ->> 'incident')`.as("resultIncidentTicket"),
   resultSummary: sql<string | null>`left(${heartbeatRuns.resultJson} ->> 'summary', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as("resultSummary"),
   resultResult: sql<string | null>`left(${heartbeatRuns.resultJson} ->> 'result', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as("resultResult"),
   resultMessage: sql<string | null>`left(${heartbeatRuns.resultJson} ->> 'message', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as("resultMessage"),
@@ -826,23 +830,38 @@ const heartbeatRunListResultColumns = {
 const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
   case
     when ${heartbeatRuns.resultJson} is null then null
-    when pg_column_size(${heartbeatRuns.resultJson}) <= ${HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES}
-      then ${heartbeatRuns.resultJson}
     else jsonb_strip_nulls(
       jsonb_build_object(
+        'securityRedacted', coalesce(
+          ${heartbeatRuns.resultJson} -> 'securityRedacted',
+          ${heartbeatRuns.resultJson} -> 'security_redacted',
+          ${heartbeatRuns.resultJson} -> 'quarantined',
+          ${heartbeatRuns.resultJson} -> 'quarantine'
+        ),
+        'redactionReason', coalesce(
+          ${heartbeatRuns.resultJson} -> 'redactionReason',
+          ${heartbeatRuns.resultJson} -> 'securityRedactionReason',
+          ${heartbeatRuns.resultJson} -> 'quarantineReason'
+        ),
+        'incidentTicket', coalesce(
+          ${heartbeatRuns.resultJson} -> 'incidentTicket',
+          ${heartbeatRuns.resultJson} -> 'incident'
+        ),
+        'redactedAt', coalesce(
+          ${heartbeatRuns.resultJson} -> 'redactedAt',
+          ${heartbeatRuns.resultJson} -> 'quarantinedAt'
+        ),
         'summary', left(${heartbeatRuns.resultJson} ->> 'summary', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS}),
         'result', left(${heartbeatRuns.resultJson} ->> 'result', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS}),
         'message', left(${heartbeatRuns.resultJson} ->> 'message', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS}),
         'error', left(${heartbeatRuns.resultJson} ->> 'error', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS}),
-        'stdout', left(${heartbeatRuns.resultJson} ->> 'stdout', ${HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS}),
-        'stderr', left(${heartbeatRuns.resultJson} ->> 'stderr', ${HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS}),
         'stdoutTruncated', case
-          when length(${heartbeatRuns.resultJson} ->> 'stdout') > ${HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS}
+          when ${heartbeatRuns.resultJson} ? 'stdout'
             then to_jsonb(true)
           else null
         end,
         'stderrTruncated', case
-          when length(${heartbeatRuns.resultJson} ->> 'stderr') > ${HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS}
+          when ${heartbeatRuns.resultJson} ? 'stderr'
             then to_jsonb(true)
           else null
         end,
@@ -889,6 +908,9 @@ const heartbeatRunLogAccessColumns = {
   companyId: heartbeatRuns.companyId,
   logStore: heartbeatRuns.logStore,
   logRef: heartbeatRuns.logRef,
+  logBytes: heartbeatRuns.logBytes,
+  logSha256: heartbeatRuns.logSha256,
+  resultJson: heartbeatRunSafeResultJsonColumn,
 } as const;
 
 const heartbeatRunIssueSummaryColumns = {
@@ -1161,7 +1183,49 @@ function isAgentContextQuietWindow(now = new Date()) {
 }
 
 export function isAgentRetireRebuildAllowedNow(now = new Date(), force = false) {
-  return force || isAgentContextQuietWindow(now);
+  return force; // ITO gated auto context-preempt rebuild 2026-07-01 (stops agent-id churn)
+}
+
+const AGENT_CONTEXT_REBUILD_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+function isAgentContextMonitorEligible(
+  agent: Pick<typeof agents.$inferSelect, "status" | "runtimeConfig" | "metadata">,
+) {
+  if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+    return false;
+  }
+
+  const metadata = parseObject(agent.metadata);
+  const runtime = parseObject(agent.runtimeConfig);
+  const heartbeat = parseObject(runtime.heartbeat);
+  const wakeOnDemand = heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation;
+  const retiredOrMerged =
+    Boolean(readNonEmptyString(metadata.retiredAt)) ||
+    Boolean(readNonEmptyString(metadata.retiredBy)) ||
+    Boolean(readNonEmptyString(metadata.replacementAgentId)) ||
+    Boolean(readNonEmptyString(metadata.mergedIntoAgentId)) ||
+    Boolean(readNonEmptyString(metadata.mergedInto)) ||
+    Boolean(readNonEmptyString(metadata.rebuiltFromAgentId));
+
+  return !(
+    retiredOrMerged &&
+    asBoolean(heartbeat.enabled, true) === false &&
+    asBoolean(wakeOnDemand, true) === false
+  );
+}
+
+function isInAgentContextRebuildCooldown(
+  agent: Pick<typeof agents.$inferSelect, "metadata">,
+  now: Date,
+) {
+  const metadata = parseObject(agent.metadata);
+  if (metadata.rebuildReason !== "agent_context_preempt") return false;
+  if (!readNonEmptyString(metadata.rebuiltFromAgentId)) return false;
+  const rebuiltAt = readNonEmptyString(metadata.rebuiltAt);
+  if (!rebuiltAt) return false;
+  const rebuiltAtMs = Date.parse(rebuiltAt);
+  if (!Number.isFinite(rebuiltAtMs)) return false;
+  return now.getTime() - rebuiltAtMs < AGENT_CONTEXT_REBUILD_COOLDOWN_MS;
 }
 
 export function buildAgentContextUsageEstimate(input: {
@@ -1398,6 +1462,108 @@ export function summarizeHeartbeatRunListResultJson(input: {
   }
 
   return Object.keys(summary).length > 0 ? summary : null;
+}
+
+const SECURITY_REDACTED_RESULT_KEYS = [
+  "securityRedacted",
+  "security_redacted",
+  "security-redacted",
+  "quarantined",
+  "quarantine",
+] as const;
+
+function readSecurityRedactedMetadata(resultJson: Record<string, unknown> | null | undefined) {
+  const result = parseObject(resultJson);
+  const metadata = parseObject(result.redaction) ?? parseObject(result.securityRedaction) ?? parseObject(result.quarantine);
+  const redacted = SECURITY_REDACTED_RESULT_KEYS.some((key) => asBoolean(result[key], false)) ||
+    asBoolean(metadata.securityRedacted, false) ||
+    asBoolean(metadata.quarantined, false);
+  if (!redacted) return null;
+
+  const redactionReason =
+    readNonEmptyString(metadata.reason) ??
+    readNonEmptyString(metadata.redactionReason) ??
+    readNonEmptyString(result.redactionReason) ??
+    readNonEmptyString(result.securityRedactionReason) ??
+    readNonEmptyString(result.quarantineReason) ??
+    "security_redacted";
+  const incidentTicket =
+    readNonEmptyString(metadata.incidentTicket) ??
+    readNonEmptyString(metadata.incident) ??
+    readNonEmptyString(result.incidentTicket) ??
+    readNonEmptyString(result.incident);
+  const redactedAt =
+    readNonEmptyString(metadata.redactedAt) ??
+    readNonEmptyString(metadata.quarantinedAt) ??
+    readNonEmptyString(result.redactedAt) ??
+    readNonEmptyString(result.quarantinedAt);
+  const originalSizeBytes = asNumber(result.originalSizeBytes) ?? asNumber(metadata.originalSizeBytes);
+
+  return {
+    securityRedacted: true,
+    redactionReason,
+    ...(incidentTicket ? { incidentTicket } : {}),
+    ...(redactedAt ? { redactedAt } : {}),
+    ...(Number.isFinite(originalSizeBytes) ? { originalSizeBytes } : {}),
+  };
+}
+
+export function isHeartbeatRunSecurityRedacted(
+  run: { resultJson?: Record<string, unknown> | null } | null | undefined,
+) {
+  return Boolean(readSecurityRedactedMetadata(run?.resultJson));
+}
+
+export function redactHeartbeatRunResultJsonForResponse(
+  resultJson: Record<string, unknown> | null | undefined,
+) {
+  const securityMetadata = readSecurityRedactedMetadata(resultJson);
+  if (securityMetadata) {
+    return {
+      ...securityMetadata,
+      bodyRedacted: true,
+      stdoutRedacted: true,
+      stderrRedacted: true,
+    };
+  }
+
+  const result = parseObject(resultJson);
+  if (!Object.keys(result).length) return null;
+  return summarizeHeartbeatRunListResultJson({
+    summary: readNonEmptyString(result.summary),
+    result: readNonEmptyString(result.result),
+    message: readNonEmptyString(result.message),
+    error: readNonEmptyString(result.error),
+    totalCostUsd: readNonEmptyString(result.total_cost_usd),
+    costUsd: readNonEmptyString(result.cost_usd),
+    costUsdCamel: readNonEmptyString(result.costUsd),
+  });
+}
+
+function redactHeartbeatRunForResponse<T extends {
+  resultJson?: Record<string, unknown> | null;
+  contextSnapshot?: Record<string, unknown> | null;
+  stdoutExcerpt?: string | null;
+  stderrExcerpt?: string | null;
+}>(run: T | null): T | null {
+  if (!run) return null;
+  const resultJson = redactHeartbeatRunResultJsonForResponse(run.resultJson);
+  if (!isHeartbeatRunSecurityRedacted({ resultJson })) {
+    return {
+      ...run,
+      resultJson,
+      stdoutExcerpt: null,
+      stderrExcerpt: null,
+    };
+  }
+
+  return {
+    ...run,
+    resultJson,
+    contextSnapshot: summarizeHeartbeatRunContextSnapshot(run.contextSnapshot),
+    stdoutExcerpt: null,
+    stderrExcerpt: null,
+  };
 }
 
 function summarizeRunFailureForIssueComment(
@@ -2669,7 +2835,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       )
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => {
+        const row = rows[0] ?? null;
+        return opts?.unsafeFullResultJson ? row : redactHeartbeatRunForResponse(row);
+      });
   }
 
   async function getRunLogAccess(runId: string) {
@@ -7238,6 +7407,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let preemptsCreated = 0;
 
     for (const agent of agentRows) {
+      if (!isAgentContextMonitorEligible(agent)) continue;
+
       const config = readContextUsageConfig(agent);
       const estimate = buildAgentContextUsageEstimate({
         agent,
@@ -7246,6 +7417,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         now,
       });
       estimates.push(estimate);
+
+      if (estimate.band === "preempt" && isInAgentContextRebuildCooldown(agent, now)) {
+        continue;
+      }
 
       if (estimate.band === "preempt") {
         const result = await createAgentContextUsageIssue(agent, estimate, "preempt", now);
@@ -10492,6 +10667,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           contextWakeReason,
           contextWakeSource,
           contextWakeTriggerDetail,
+          resultSecurityRedacted,
+          resultSecurityRedactedSnake,
+          resultQuarantined,
+          resultQuarantine,
+          resultRedactionReason,
+          resultIncidentTicket,
           resultSummary,
           resultResult,
           resultMessage,
@@ -10508,7 +10689,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           resultTotalCostUsd?: string | null;
           resultCostUsd?: string | null;
           resultCostUsdCamel?: string | null;
+          resultSecurityRedacted?: string | null;
+          resultSecurityRedactedSnake?: string | null;
+          resultQuarantined?: string | null;
+          resultQuarantine?: string | null;
+          resultRedactionReason?: string | null;
+          resultIncidentTicket?: string | null;
         };
+        const securityRedacted =
+          resultSecurityRedacted === "true" ||
+          resultSecurityRedactedSnake === "true" ||
+          resultQuarantined === "true" ||
+          resultQuarantine === "true";
 
         return {
           ...rest,
@@ -10524,7 +10716,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }),
           resultJson: safeForLegacyEncoding
             ? null
-            : summarizeHeartbeatRunListResultJson({
+            : securityRedacted
+              ? {
+                  securityRedacted: true,
+                  redactionReason: readNonEmptyString(resultRedactionReason) ?? "security_redacted",
+                  ...(readNonEmptyString(resultIncidentTicket) ? { incidentTicket: readNonEmptyString(resultIncidentTicket) } : {}),
+                  bodyRedacted: true,
+                  stdoutRedacted: true,
+                  stderrRedacted: true,
+                }
+              : summarizeHeartbeatRunListResultJson({
                 summary: resultSummary,
                 result: resultResult,
                 message: resultMessage,
@@ -10639,12 +10840,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         companyId: string;
         logStore: string | null;
         logRef: string | null;
+        logBytes?: number | null;
+        logSha256?: string | null;
+        resultJson?: Record<string, unknown> | null;
       },
       opts?: { offset?: number; limitBytes?: number },
     ) => {
       const run = typeof runOrLookup === "string" ? await getRunLogAccess(runOrLookup) : runOrLookup;
       const runId = typeof runOrLookup === "string" ? runOrLookup : runOrLookup.id;
       if (!run) throw notFound("Heartbeat run not found");
+      const redactedResultJson = redactHeartbeatRunResultJsonForResponse(run.resultJson);
+      if (isHeartbeatRunSecurityRedacted({ resultJson: redactedResultJson })) {
+        return {
+          runId,
+          store: run.logStore,
+          logRef: run.logRef,
+          content: "[security redacted run log]",
+          nextOffset: run.logBytes ?? 0,
+          redacted: true,
+          resultJson: redactedResultJson,
+          logBytes: run.logBytes ?? null,
+          logSha256: run.logSha256 ?? null,
+        };
+      }
       if (!run.logStore || !run.logRef) throw notFound("Run log not found");
 
       const result = await runLogStore.read(

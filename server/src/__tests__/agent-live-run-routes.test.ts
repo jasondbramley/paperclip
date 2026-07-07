@@ -10,7 +10,9 @@ const mockHeartbeatService = vi.hoisted(() => ({
   buildRunOutputSilence: vi.fn(),
   getRunIssueSummary: vi.fn(),
   getActiveRunIssueSummaryForAgent: vi.fn(),
+  getRun: vi.fn(),
   getRunLogAccess: vi.fn(),
+  listEvents: vi.fn(),
   readLog: vi.fn(),
   wakeup: vi.fn(),
 }));
@@ -38,6 +40,9 @@ function registerModuleMocks() {
 
   vi.doMock("../services/heartbeat.js", () => ({
     heartbeatService: () => mockHeartbeatService,
+    isHeartbeatRunSecurityRedacted: (run: { resultJson?: Record<string, unknown> | null } | null) =>
+      !!run?.resultJson && typeof run.resultJson === "object" && !!run.resultJson && (run.resultJson as Record<string, unknown>).securityRedacted,
+    redactHeartbeatRunResultJsonForResponse: (resultJson?: Record<string, unknown> | null) => resultJson,
   }));
 
   vi.doMock("../services/instance-settings.js", () => ({
@@ -200,12 +205,22 @@ describe("agent live run routes", () => {
     });
     mockHeartbeatService.getActiveRunIssueSummaryForAgent.mockResolvedValue(null);
     mockHeartbeatService.buildRunOutputSilence.mockResolvedValue(null);
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-1",
+      companyId: "company-1",
+      status: "running",
+      resultJson: null,
+      createdAt: new Date("2026-04-10T09:29:59.000Z"),
+      updatedAt: new Date("2026-04-10T09:29:59.000Z"),
+      finishedAt: null,
+    });
     mockHeartbeatService.getRunLogAccess.mockResolvedValue({
       id: "run-1",
       companyId: "company-1",
       logStore: "local_file",
       logRef: "logs/run-1.ndjson",
     });
+    mockHeartbeatService.listEvents.mockResolvedValue([]);
     mockHeartbeatService.readLog.mockResolvedValue({
       runId: "run-1",
       store: "local_file",
@@ -318,6 +333,42 @@ describe("agent live run routes", () => {
       content: "chunk",
       nextOffset: 5,
     });
+  });
+
+  it("returns a synthetic redaction event for security-redacted runs without loading raw events", async () => {
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-1",
+      companyId: "company-1",
+      status: "succeeded",
+      resultJson: {
+        securityRedacted: true,
+        redactionReason: "credential_exposure",
+        incidentTicket: "ITO-182",
+      },
+      createdAt: new Date("2026-04-10T09:29:59.000Z"),
+      updatedAt: new Date("2026-04-10T09:40:00.000Z"),
+      finishedAt: new Date("2026-04-10T09:39:00.000Z"),
+    });
+
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl).get("/api/heartbeat-runs/run-1/events"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockHeartbeatService.listEvents).not.toHaveBeenCalled();
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0]).toMatchObject({
+      runId: "run-1",
+      eventType: "security_redacted",
+      message: "Run events are security redacted.",
+      payload: {
+        securityRedacted: true,
+        redactionReason: "credential_exposure",
+        incidentTicket: "ITO-182",
+      },
+    });
+    expect(JSON.stringify(res.body)).not.toContain("synthetic-sensitive");
   });
 
   it("caps company live run polling by default", async () => {
