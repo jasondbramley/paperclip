@@ -7460,20 +7460,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
 
-      if (estimate.band === "preempt") {
-        const result = await createAgentContextUsageIssue(agent, estimate, "preempt", now);
-        if (result.created) preemptsCreated += 1;
-        if (estimate.quietWindow) {
-          await executeAgentRetireRebuild({
-            agentId: agent.id,
-            now,
-            auditIssueId: result.issueId,
-            reason: "agent_context_preempt",
-          });
+      // ITO 2026-07-08: context monitor is REPORT-ONLY. On 07-08 02:00-03:20 UTC
+      // the preempt issues' embedded runbook was executed by the CEO agent
+      // (rebuilt 6 agents + looped the SDL lineage to generation 8) even though
+      // executeAgentRetireRebuild itself was force-gated. Do not create issues
+      // (their instruction text is an execution vector) until the estimator is
+      // fixed (fresh agents inherit assignedTicketTokens and estimate >100%)
+      // and the circuit-breaker design is implemented. Opt back in via
+      // AGENT_CONTEXT_MONITOR_CREATE_ISSUES=1.
+      if (process.env.AGENT_CONTEXT_MONITOR_CREATE_ISSUES === "1") {
+        if (estimate.band === "preempt") {
+          const result = await createAgentContextUsageIssue(agent, estimate, "preempt", now);
+          if (result.created) preemptsCreated += 1;
+          if (estimate.quietWindow) {
+            await executeAgentRetireRebuild({
+              agentId: agent.id,
+              now,
+              auditIssueId: result.issueId,
+              reason: "agent_context_preempt",
+            });
+          }
+        } else if (estimate.band === "warn") {
+          const result = await createAgentContextUsageIssue(agent, estimate, "warning", now);
+          if (result.created) warningsCreated += 1;
         }
-      } else if (estimate.band === "warn") {
-        const result = await createAgentContextUsageIssue(agent, estimate, "warning", now);
-        if (result.created) warningsCreated += 1;
       }
     }
 
