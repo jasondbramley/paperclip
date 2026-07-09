@@ -82,6 +82,12 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 describeEmbeddedPostgres("agent context preempt retire/rebuild", () => {
+  // FORK-NOTE (2026-07-09): the context monitor is report-only in production
+  // (AGENT_CONTEXT_MONITOR_CREATE_ISSUES gate, runaway circuit-breaker). These
+  // tests exercise the gated issue-creation logic, so enable it for the suite.
+  beforeAll(() => { process.env.AGENT_CONTEXT_MONITOR_CREATE_ISSUES = "1"; });
+  afterAll(() => { delete process.env.AGENT_CONTEXT_MONITOR_CREATE_ISSUES; });
+
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
 

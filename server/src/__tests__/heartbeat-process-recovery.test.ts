@@ -2883,7 +2883,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("Retry in progress.");
   });
 
-  it("blocks stranded in-progress work after the continuation retry was already used", async () => {
+  // FORK-NOTE (2026-07-09): tests upstream #7031 continuation-retry-streaks, deferred by this fork
+  // in favour of its stream-disconnect/context-overflow machinery. Re-enable at fork-shrink consolidation.
+  it.skip("blocks stranded in-progress work after the continuation retry was already used", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -2916,7 +2918,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("Recovery owner: [CodexCoder]");
   });
 
-  it("redacts error-code-only stranded recovery failures in issue copy", async () => {
+  // FORK-NOTE (2026-07-09): tests upstream #7031 continuation-retry-streaks, deferred by this fork
+  // in favour of its stream-disconnect/context-overflow machinery. Re-enable at fork-shrink consolidation.
+  it.skip("redacts error-code-only stranded recovery failures in issue copy", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -2948,7 +2952,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).not.toContain("- Failure: none recorded");
   });
 
-  it("keeps retrying transient adapter_failed continuation runs before the cap", async () => {
+  // FORK-NOTE (2026-07-09): tests upstream #7031 continuation-retry-streaks, deferred by this fork
+  // in favour of its stream-disconnect/context-overflow machinery. Re-enable at fork-shrink consolidation.
+  it.skip("keeps retrying transient adapter_failed continuation runs before the cap", async () => {
     const { agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -2979,7 +2985,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
-  it("escalates after repeated adapter_failed continuation retries with the cause in the comment", async () => {
+  // FORK-NOTE (2026-07-09): tests upstream #7031 continuation-retry-streaks, deferred by this fork
+  // in favour of its stream-disconnect/context-overflow machinery. Re-enable at fork-shrink consolidation.
+  it.skip("escalates after repeated adapter_failed continuation retries with the cause in the comment", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -3041,7 +3049,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("Latest cause: `adapter_failed`");
   });
 
-  it("does not count mixed-cause continuation failures toward the transient cap", async () => {
+  // FORK-NOTE (2026-07-09): tests upstream #7031 continuation-retry-streaks, deferred by this fork
+  // in favour of its stream-disconnect/context-overflow machinery. Re-enable at fork-shrink consolidation.
+  it.skip("does not count mixed-cause continuation failures toward the transient cap", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -3145,7 +3155,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
-  it("escalates non-retryable continuation failures immediately without enqueuing another retry", async () => {
+  // FORK-NOTE (2026-07-09): tests upstream #7031 continuation-retry-streaks, deferred by this fork
+  // in favour of its stream-disconnect/context-overflow machinery. Re-enable at fork-shrink consolidation.
+  it.skip("escalates non-retryable continuation failures immediately without enqueuing another retry", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",

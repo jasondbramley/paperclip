@@ -52,6 +52,7 @@ const mockIssueService = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
 vi.mock("../services/index.js", () => ({
+  documentAnnotationService: () => ({}),
   clampIssueListLimit: () => ({}),
   companySearchService: () => ({}),
   issueThreadInteractionService: () => ({}),
