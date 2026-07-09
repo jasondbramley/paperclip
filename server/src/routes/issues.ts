@@ -1964,9 +1964,16 @@ export function issueRoutes(
       if (!activeRecoveryAction || (actionId && activeRecoveryAction.id !== actionId)) {
         throw notFound("Active recovery action not found");
       }
-      if (activeRecoveryAction.kind !== "missing_disposition" || !isPinnedLiveChatAnchorIssue(existing)) {
+      const continuablePinnedAnchorRecoveryKinds = new Set([
+        "missing_disposition",
+        "stranded_assigned_issue",
+      ]);
+      if (
+        !continuablePinnedAnchorRecoveryKinds.has(activeRecoveryAction.kind) ||
+        !isPinnedLiveChatAnchorIssue(existing)
+      ) {
         throw unprocessable(
-          "Continued recovery resolution is only allowed for missing-disposition recovery on explicitly pinned live chat anchors",
+          "Continued recovery resolution is only allowed for stale recovery on explicitly pinned live chat anchors",
         );
       }
     }

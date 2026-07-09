@@ -594,6 +594,55 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
   });
 
+  it("resolves stranded recovery while keeping a pinned live chat anchor in progress", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({
+        title: "[PIN OPEN] Coding Agent chat mirror",
+        description: "Pinned chat mirror. DO NOT CLOSE while waiting for the next Teams comment.",
+        status: "in_progress",
+      })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded-assigned:live-anchor",
+      evidence: { latestIssueStatus: "in_progress" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "continued",
+        sourceIssueStatus: "in_progress",
+        resolutionNote: "Pinned chat mirror remains live awaiting the next Teams comment.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "in_progress",
+      activeRecoveryAction: null,
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "continued",
+      resolutionNote: "Pinned chat mirror remains live awaiting the next Teams comment.",
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
   it("rejects continued recovery resolution for ordinary missing-disposition issues", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const recoveryActionSvc = issueRecoveryActionService(db);
@@ -607,6 +656,49 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       fingerprint: "missing-disposition:ordinary-issue",
       evidence: { sourceRunId: "run-1" },
       nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const rejected = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "continued",
+        sourceIssueStatus: "in_progress",
+        resolutionNote: "Keep this ordinary issue in progress.",
+      })
+      .expect(422);
+
+    expect(rejected.body.error).toContain("explicitly pinned live chat anchors");
+
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "active",
+      outcome: null,
+      resolvedAt: null,
+    });
+  });
+
+  it("rejects continued stranded recovery resolution for ordinary issues", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded-assigned:ordinary-issue",
+      evidence: { latestIssueStatus: "in_progress" },
+      nextAction: "Restore a live execution path.",
       wakePolicy: { type: "wake_owner" },
     });
     const app = createApp();
