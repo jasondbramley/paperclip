@@ -70,6 +70,21 @@ describe("agent context usage estimates", () => {
     expect(estimate.band).toBe("ok");
     expect(estimate.quietWindow).toBe(false);
   });
+
+  it("keeps raw assigned ticket tokens advisory-only", () => {
+    const estimate = buildAgentContextUsageEstimate({
+      agent: baseAgent,
+      recentRunUsageTokens: 300,
+      assignedTicketTextTokens: 0,
+      rawAssignedTicketTextTokens: 1_000,
+      now: new Date("2026-05-24T12:00:00Z"),
+    });
+
+    expect(estimate.components.assignedTicketTokens).toBe(0);
+    expect(estimate.components.rawAssignedTicketTokens).toBe(1_000);
+    expect(estimate.estimatedTokens).toBe(400);
+    expect(estimate.band).toBe("ok");
+  });
 });
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -84,8 +99,11 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("agent context preempt retire/rebuild", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
+  let previousCreateIssuesGate: string | undefined;
 
   beforeAll(async () => {
+    previousCreateIssuesGate = process.env.AGENT_CONTEXT_MONITOR_CREATE_ISSUES;
+    process.env.AGENT_CONTEXT_MONITOR_CREATE_ISSUES = "1";
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-agent-context-usage-");
     db = createDb(tempDb.connectionString);
   }, 30_000);
@@ -95,6 +113,11 @@ describeEmbeddedPostgres("agent context preempt retire/rebuild", () => {
   });
 
   afterAll(async () => {
+    if (previousCreateIssuesGate === undefined) {
+      delete process.env.AGENT_CONTEXT_MONITOR_CREATE_ISSUES;
+    } else {
+      process.env.AGENT_CONTEXT_MONITOR_CREATE_ISSUES = previousCreateIssuesGate;
+    }
     await tempDb?.cleanup();
   });
 
@@ -250,7 +273,7 @@ describeEmbeddedPostgres("agent context preempt retire/rebuild", () => {
     expect(preemptIssues[0]?.originId).toBe(seeded.agentId);
   });
 
-  it("retires and rebuilds during the quiet window while redistributing active tickets safely", async () => {
+  it("does not retire and rebuild during the quiet window while retire/rebuild is force-gated", async () => {
     const seeded = await seedPreemptCandidate();
     const heartbeat = heartbeatService(db);
 
@@ -269,23 +292,13 @@ describeEmbeddedPostgres("agent context preempt retire/rebuild", () => {
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, preemptIssues[0]!.id));
     const auditRows = await db.select().from(activityLog).where(eq(activityLog.action, "agent.retire_rebuild"));
 
-    expect(source?.status).toBe("terminated");
-    expect(replacement).toMatchObject({
-      name: "Context Agent",
-      adapterType: "codex_local",
-      adapterConfig: { model: "gpt-test" },
-      permissions: { grants: ["issues:update"] },
-    });
-    expect(activeIssue?.assigneeAgentId).toBe(replacement?.id);
-    expect(reportee?.reportsTo).toBe(replacement?.id);
-    expect(preemptIssues[0]?.status).toBe("done");
-    expect(comments[0]?.body).toContain("Automatic retire/rebuild completed.");
-    expect(auditRows[0]?.details).toMatchObject({
-      retiredAgentId: seeded.agentId,
-      replacementAgentId: replacement?.id,
-      ticketsRedistributed: 1,
-      reporteesUpdated: 1,
-    });
+    expect(source?.status).toBe("idle");
+    expect(replacement).toBeUndefined();
+    expect(activeIssue?.assigneeAgentId).toBe(seeded.agentId);
+    expect(reportee?.reportsTo).toBe(seeded.agentId);
+    expect(preemptIssues[0]?.status).toBe("todo");
+    expect(comments).toHaveLength(0);
+    expect(auditRows).toHaveLength(0);
 
     const secondResult = await heartbeat.scanAgentContextUsage({
       companyId: seeded.companyId,
@@ -296,8 +309,162 @@ describeEmbeddedPostgres("agent context preempt retire/rebuild", () => {
     const auditRowsAfterSecondScan = await db.select().from(activityLog).where(eq(activityLog.action, "agent.retire_rebuild"));
 
     expect(secondResult.preemptsCreated).toBe(0);
-    expect(replacementsAfterSecondScan).toHaveLength(2);
+    expect(replacementsAfterSecondScan).toHaveLength(1);
     expect(preemptIssuesAfterSecondScan).toHaveLength(1);
-    expect(auditRowsAfterSecondScan).toHaveLength(1);
+    expect(auditRowsAfterSecondScan).toHaveLength(0);
+  });
+
+  it("does not count inherited assigned ticket text for a freshly rebuilt untouched agent", async () => {
+    const companyId = randomUUID();
+    const sourceAgentId = randomUUID();
+    const replacementAgentId = randomUUID();
+    const inheritedIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: sourceAgentId,
+        companyId,
+        name: "Context Agent",
+        role: "engineer",
+        status: "terminated",
+        capabilities: "minimal",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+        metadata: {
+          replacementAgentId,
+          retiredBy: "agent_context_preempt",
+          retiredAt: "2026-07-08T02:00:00.000Z",
+        },
+      },
+      {
+        id: replacementAgentId,
+        companyId,
+        name: "Context Agent",
+        role: "engineer",
+        status: "idle",
+        capabilities: "minimal",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {
+          heartbeat: {
+            contextMonitor: {
+              contextWindowTokens: 1_000,
+              warningRatio: 0.8,
+              preemptRatio: 0.9,
+            },
+          },
+        },
+        permissions: {},
+        metadata: {
+          rebuiltFromAgentId: sourceAgentId,
+          rebuiltAt: "2026-07-08T02:05:00.000Z",
+          rebuildReason: "agent_context_preempt",
+        },
+      },
+    ]);
+    await db.insert(issues).values({
+      id: inheritedIssueId,
+      companyId,
+      title: "Inherited large assignment",
+      description: "x".repeat(4_000),
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: replacementAgentId,
+      issueNumber: 1,
+      identifier: "PAP-1",
+    });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId: inheritedIssueId,
+      authorAgentId: sourceAgentId,
+      authorType: "agent",
+      body: "y".repeat(4_000),
+    });
+
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanAgentContextUsage({
+      companyId,
+      now: new Date("2026-07-08T02:10:00Z"),
+    });
+
+    const replacementEstimate = result.estimates.find((estimate) => estimate.agentId === replacementAgentId);
+    expect(replacementEstimate?.components.assignedTicketTokens).toBe(0);
+    expect(replacementEstimate?.components.rawAssignedTicketTokens).toBeGreaterThan(1_900);
+    expect(replacementEstimate?.estimatedTokens).toBeLessThan(800);
+    expect(replacementEstimate?.band).toBe("ok");
+    expect(result.preemptsCreated).toBe(0);
+  });
+
+  it("counts assigned ticket text for issues the agent has already touched", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const touchedIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Context Agent",
+      role: "engineer",
+      status: "idle",
+      capabilities: "minimal",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          contextMonitor: {
+            contextWindowTokens: 5_000,
+            warningRatio: 0.8,
+            preemptRatio: 0.9,
+          },
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: touchedIssueId,
+      companyId,
+      title: "Touched work",
+      description: "x".repeat(4_000),
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: "PAP-1",
+    });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId: touchedIssueId,
+      authorAgentId: agentId,
+      authorType: "agent",
+      body: "agent-side planning and follow-up context",
+    });
+
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanAgentContextUsage({
+      companyId,
+      now: new Date("2026-07-08T02:20:00Z"),
+    });
+
+    const estimate = result.estimates.find((item) => item.agentId === agentId);
+    expect(estimate).toBeDefined();
+    expect(estimate?.components.rawAssignedTicketTokens).toBe(estimate?.components.assignedTicketTokens);
+    expect(estimate?.components.assignedTicketTokens).toBeGreaterThan(0);
+    expect(estimate?.band).toBe("ok");
   });
 });

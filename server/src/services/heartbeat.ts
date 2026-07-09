@@ -1080,6 +1080,7 @@ export interface AgentContextUsageEstimate {
     capabilitiesTokens: number;
     recentRunTokens: number;
     assignedTicketTokens: number;
+    rawAssignedTicketTokens: number;
   };
 }
 
@@ -1232,13 +1233,19 @@ export function buildAgentContextUsageEstimate(input: {
   agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "name" | "adapterType" | "adapterConfig" | "runtimeConfig" | "capabilities">;
   recentRunUsageTokens: number;
   assignedTicketTextTokens: number;
+  rawAssignedTicketTextTokens?: number;
   now?: Date;
 }): AgentContextUsageEstimate {
   const config = readContextUsageConfig(input.agent);
+  const assignedTicketTokens = Math.max(0, Math.floor(input.assignedTicketTextTokens));
   const components = {
     capabilitiesTokens: estimateTextTokens(input.agent.capabilities),
     recentRunTokens: Math.max(0, Math.floor(input.recentRunUsageTokens)),
-    assignedTicketTokens: Math.max(0, Math.floor(input.assignedTicketTextTokens)),
+    assignedTicketTokens,
+    rawAssignedTicketTokens: Math.max(
+      assignedTicketTokens,
+      Math.floor(input.rawAssignedTicketTextTokens ?? input.assignedTicketTextTokens),
+    ),
   };
   const estimatedTokens =
     components.capabilitiesTokens +
@@ -7127,35 +7134,70 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         id: issues.id,
         title: issues.title,
         description: issues.description,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
       })
       .from(issues)
       .where(and(eq(issues.assigneeAgentId, agentId), inArray(issues.status, [...activeStatuses])));
-    if (assigned.length === 0) return 0;
+    if (assigned.length === 0) {
+      return { countedTokens: 0, rawTokens: 0, touchedIssueCount: 0, totalIssueCount: 0 };
+    }
 
     const issueIds = assigned.map((issue) => issue.id);
+    const agentRunRows = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const agentRunIds = new Set(agentRunRows.map((row) => row.id));
     const commentRows = await db
       .select({
         issueId: issueComments.issueId,
         body: issueComments.body,
+        authorAgentId: issueComments.authorAgentId,
+        createdByRunId: issueComments.createdByRunId,
       })
       .from(issueComments)
       .where(inArray(issueComments.issueId, issueIds));
     const commentTokensByIssue = new Map<string, number>();
+    const touchedIssueIds = new Set<string>();
     for (const row of commentRows) {
       commentTokensByIssue.set(
         row.issueId,
         (commentTokensByIssue.get(row.issueId) ?? 0) + estimateTextTokens(row.body),
       );
+      if (row.authorAgentId === agentId || (row.createdByRunId && agentRunIds.has(row.createdByRunId))) {
+        touchedIssueIds.add(row.issueId);
+      }
     }
 
-    return assigned.reduce(
-      (total, issue) =>
-        total +
+    const tokensByIssue = new Map<string, number>();
+    for (const issue of assigned) {
+      const tokens =
         estimateTextTokens(issue.title) +
         estimateTextTokens(issue.description) +
-        (commentTokensByIssue.get(issue.id) ?? 0),
-      0,
-    );
+        (commentTokensByIssue.get(issue.id) ?? 0);
+      tokensByIssue.set(issue.id, tokens);
+      if (
+        (issue.checkoutRunId && agentRunIds.has(issue.checkoutRunId)) ||
+        (issue.executionRunId && agentRunIds.has(issue.executionRunId))
+      ) {
+        touchedIssueIds.add(issue.id);
+      }
+    }
+
+    let rawTokens = 0;
+    let countedTokens = 0;
+    for (const [issueId, tokens] of tokensByIssue) {
+      rawTokens += tokens;
+      if (touchedIssueIds.has(issueId)) countedTokens += tokens;
+    }
+
+    return {
+      countedTokens,
+      rawTokens,
+      touchedIssueCount: touchedIssueIds.size,
+      totalIssueCount: assigned.length,
+    };
   }
 
   async function findOpenAgentContextIssue(input: {
@@ -7207,7 +7249,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       `Agent: ${agent.name}`,
       `Adapter: ${agent.adapterType}`,
       `Estimated context usage: ${estimate.estimatedTokens.toLocaleString()} / ${estimate.contextWindowTokens.toLocaleString()} tokens (${ratioPct}%).`,
-      `Components: capabilities ${estimate.components.capabilitiesTokens.toLocaleString()}, recent runs ${estimate.components.recentRunTokens.toLocaleString()}, assigned ticket text/comments ${estimate.components.assignedTicketTokens.toLocaleString()}.`,
+      `Components: capabilities ${estimate.components.capabilitiesTokens.toLocaleString()}, recent runs ${estimate.components.recentRunTokens.toLocaleString()}, touched assigned ticket text/comments ${estimate.components.assignedTicketTokens.toLocaleString()}.`,
+      `Raw assigned ticket text/comments, including untouched inherited assignments: ${estimate.components.rawAssignedTicketTokens.toLocaleString()}.`,
       `Quiet window: ${estimate.quietWindow ? "yes" : "no"}.`,
       "",
       kind === "warning"
@@ -7448,10 +7491,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!isAgentContextMonitorEligible(agent)) continue;
 
       const config = readContextUsageConfig(agent);
+      const assignedTicketTokens = await estimateAssignedTicketTextTokens(agent.id);
       const estimate = buildAgentContextUsageEstimate({
         agent,
         recentRunUsageTokens: await estimateRecentRunUsageTokens(agent.id, config.recentRuns),
-        assignedTicketTextTokens: await estimateAssignedTicketTextTokens(agent.id),
+        assignedTicketTextTokens: assignedTicketTokens.countedTokens,
+        rawAssignedTicketTextTokens: assignedTicketTokens.rawTokens,
         now,
       });
       estimates.push(estimate);
