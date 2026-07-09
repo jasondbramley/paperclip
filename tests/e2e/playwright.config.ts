@@ -8,7 +8,7 @@ import { defineConfig } from "@playwright/test";
 const PORT = Number(process.env.PAPERCLIP_E2E_PORT ?? 3199);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 const PAPERCLIP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-e2e-home-"));
-const chromiumChannel = process.env.PLAYWRIGHT_CHROMIUM_CHANNEL as "chrome" | undefined;
+const PLAYWRIGHT_CHANNEL = process.env.PAPERCLIP_PLAYWRIGHT_CHANNEL;
 
 export default defineConfig({
   testDir: ".",
@@ -29,7 +29,7 @@ export default defineConfig({
       name: "chromium",
       use: {
         browserName: "chromium",
-        ...(chromiumChannel ? { channel: chromiumChannel } : {}),
+        ...(PLAYWRIGHT_CHANNEL ? { channel: PLAYWRIGHT_CHANNEL } : {}),
       },
     },
   ],
