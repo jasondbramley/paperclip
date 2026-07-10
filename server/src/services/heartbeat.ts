@@ -9395,11 +9395,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : sanitizedChunk;
 
         publishLiveEvent({
-          companyId: run.companyId,
+          companyId: currentRun.companyId,
           type: "heartbeat.run.log",
           payload: {
-            runId: run.id,
-            agentId: run.agentId,
+            runId: currentRun.id,
+            agentId: currentRun.agentId,
             ts,
             stream,
             chunk: payloadChunk,
@@ -9556,7 +9556,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           onLog,
           onMeta: onAdapterMeta,
           onSpawn: async (meta) => {
-            await persistRunProcessMetadata(run.id, {
+            await persistRunProcessMetadata(currentRun.id, {
               pid: meta.pid,
               processGroupId:
                 "processGroupId" in meta && typeof meta.processGroupId === "number"
