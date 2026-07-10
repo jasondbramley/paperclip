@@ -59,6 +59,7 @@ vi.mock("../services/index.js", () => ({
   accessService: () => ({
     canUser: vi.fn(),
     hasPermission: vi.fn(),
+    decide: vi.fn(async () => ({ allowed: true })),
   }),
   agentService: () => ({
     getById: vi.fn(),

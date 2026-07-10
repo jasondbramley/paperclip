@@ -256,7 +256,11 @@ describeEmbeddedPostgres("agent context preempt retire/rebuild", () => {
     expect(preemptIssues[0]?.originId).toBe(seeded.agentId);
   });
 
-  it("retires and rebuilds during the quiet window while redistributing active tickets safely", async () => {
+  // FORK-NOTE (2026-07-10): auto retire+rebuild is deliberately gated OFF since
+  // 2026-07-01 (isAgentRetireRebuildAllowedNow returns force only — June runaway
+  // safeguard). This test asserts the pre-gate behaviour and fails by design until
+  // the circuit-breaker design re-enables auto-rebuild. Re-enable this test then.
+  it.skip("retires and rebuilds during the quiet window while redistributing active tickets safely", async () => {
     const seeded = await seedPreemptCandidate();
     const heartbeat = heartbeatService(db);
 
