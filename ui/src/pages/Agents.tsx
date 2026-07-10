@@ -38,7 +38,8 @@ type FilterTab = "all" | "active" | "paused" | "error";
 // lives in the task thread, not an agent run state (PAP-75).
 const HIDDEN_AGENT_STATUSES = new Set(["terminated", "pending_approval"]);
 
-function matchesFilter(status: string, tab: FilterTab): boolean {
+function matchesFilter(status: string, tab: FilterTab, showTerminated: boolean): boolean {
+  if (status === "terminated") return showTerminated;
   if (tab === "all") return true;
   if (tab === "active") return status === "active" || status === "running" || status === "idle";
   if (tab === "paused") return status === "paused";
@@ -46,7 +47,7 @@ function matchesFilter(status: string, tab: FilterTab): boolean {
   return true;
 }
 
-function filterAgents(agents: Agent[], tab: FilterTab): Agent[] {
+function filterAgents(agents: Agent[], tab: FilterTab, showTerminated: boolean): Agent[] {
   return agents
     .filter((a) => (showTerminated || !HIDDEN_AGENT_STATUSES.has(a.status)) && matchesFilter(agentDisplayStatus(a), tab, showTerminated))
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -381,7 +382,6 @@ function OrgTreeNode({
     membershipMutation.variables.resourceId === node.id;
 
   const displayStatus = agent ? agentDisplayStatus(agent) : node.status;
-  const statusColor = agentStatusDot[displayStatus] ?? agentStatusDotDefault;
 
   return (
     <div style={{ paddingLeft: depth * 24 }}>

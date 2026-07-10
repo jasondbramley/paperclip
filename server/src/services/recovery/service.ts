@@ -565,6 +565,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (Number.isFinite(parsed) && parsed > 0) return parsed;
     }
     return DEFAULT_ADAPTER_SILENT_HANG_TIMEOUT_MS;
+  }
 
   async function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined) {
     return (await evaluateAgentInvokabilityFromDb(db, agent)).invokable;
