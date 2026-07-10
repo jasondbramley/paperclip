@@ -1846,7 +1846,8 @@ function readSecurityRedactedMetadata(resultJson: Record<string, unknown> | null
     readNonEmptyString(metadata.quarantinedAt) ??
     readNonEmptyString(result.redactedAt) ??
     readNonEmptyString(result.quarantinedAt);
-  const originalSizeBytes = asNumber(result.originalSizeBytes) ?? asNumber(metadata.originalSizeBytes);
+  const readOptionalNumber = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+  const originalSizeBytes = readOptionalNumber(result.originalSizeBytes) ?? readOptionalNumber(metadata.originalSizeBytes);
 
   return {
     securityRedacted: true,
@@ -7765,8 +7766,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
       });
-      if (!finalizedRun) finalizedRun = await getRun(run.id);
-      if (!finalizedRun) continue;
+      if (!finalizedRun) {
+        const refreshedRun = await getRun(run.id);
+        if (!refreshedRun) continue;
+        finalizedRun = refreshedRun;
+      }
       finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
       await releaseEnvironmentLeasesForRun({
         runId: finalizedRun.id,
@@ -9301,7 +9305,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           lastOutputBytes: pendingOutputProgress.bytes,
           updatedAt: new Date(),
         })
-        .where(eq(heartbeatRuns.id, run.id));
+        .where(eq(heartbeatRuns.id, runId));
       lastOutputFlushAt = pendingOutputProgress.at;
       outputProgressState.pending = null;
     };
