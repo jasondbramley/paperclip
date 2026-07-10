@@ -19,7 +19,7 @@ import { agentDisplayStatus } from "../lib/agent-display-status";
 import { PageTabBar } from "../components/PageTabBar";
 import { Tabs } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
-import { AlertTriangle, Bot, Plus, List, GitBranch } from "lucide-react";
+import { AlertTriangle, Bot, Plus, List, GitBranch, SlidersHorizontal } from "lucide-react";
 import { AGENT_ROLE_LABELS, type Agent } from "@paperclipai/shared";
 import {
   resourceMembershipState,
@@ -90,6 +90,8 @@ export function Agents() {
   const tab: FilterTab = (pathSegment === "all" || pathSegment === "active" || pathSegment === "paused" || pathSegment === "error") ? pathSegment : "all";
   const [view, setView] = useState<"list" | "org">("org");
   const forceListView = isMobile;
+  const [showTerminated, setShowTerminated] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(false);
   const effectiveView: "list" | "org" = forceListView ? "list" : view;
 
   const { data: agents, isLoading, error } = useQuery({
@@ -165,6 +167,36 @@ export function Agents() {
           />
         </Tabs>
         <div className="flex items-center gap-2">
+          {/* Filters */}
+          <div className="relative">
+            <button
+              className={cn(
+                "flex items-center gap-1.5 px-2 py-1.5 text-xs transition-colors border border-border",
+                filtersOpen || showTerminated ? "text-foreground bg-accent" : "text-muted-foreground hover:bg-accent/50"
+              )}
+              onClick={() => setFiltersOpen(!filtersOpen)}
+            >
+              <SlidersHorizontal className="h-3 w-3" />
+              Filters
+              {showTerminated && <span className="ml-0.5 px-1 bg-foreground/10 rounded text-[10px]">1</span>}
+            </button>
+            {filtersOpen && (
+              <div className="absolute right-0 top-full mt-1 z-50 w-48 border border-border bg-popover shadow-md p-1">
+                <button
+                  className="flex items-center gap-2 w-full px-2 py-1.5 text-xs text-left hover:bg-accent/50 transition-colors"
+                  onClick={() => setShowTerminated(!showTerminated)}
+                >
+                  <span className={cn(
+                    "flex items-center justify-center h-3.5 w-3.5 border border-border rounded-sm",
+                    showTerminated && "bg-foreground"
+                  )}>
+                    {showTerminated && <span className="text-background text-[10px] leading-none">&#10003;</span>}
+                  </span>
+                  Show terminated
+                </button>
+              </div>
+            )}
+          </div>
           {/* View toggle */}
           {!forceListView && (
             <div className="flex items-center border border-border">
