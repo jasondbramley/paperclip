@@ -173,13 +173,17 @@ describe("agent local JWT", () => {
     });
   });
 
-  it("defaults TTL to 1h when PAPERCLIP_AGENT_JWT_TTL_SECONDS is unset", () => {
+  // FORK-NOTE (hop 5, 2026-07-11): ITO keeps a 6h default local-agent JWT TTL
+  // (DEFAULT_LOCAL_AGENT_JWT_TTL_SECONDS = 60*60*6) so long-running agent sessions
+  // don't have their token expire mid-run; upstream reverted this to 1h. Assertion
+  // aligned to the fork value.
+  it("defaults TTL to 6h (ITO fork) when PAPERCLIP_AGENT_JWT_TTL_SECONDS is unset", () => {
     delete process.env[ttlEnv];
     vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
     const token = createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1");
     const claims = verifyLocalAgentJwt(token!);
     expect(claims).not.toBeNull();
-    expect(claims!.exp - claims!.iat).toBe(60 * 60);
+    expect(claims!.exp - claims!.iat).toBe(60 * 60 * 6);
   });
 
   // Helper: hand-craft a token signed with the raw master secret (legacy path).
