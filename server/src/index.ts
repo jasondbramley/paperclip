@@ -802,12 +802,6 @@ export async function startServer(): Promise<StartedServer> {
         );
       }
 
-      const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-      if (reconciled.escalationsCreated > 0) {
-        logger.warn({ ...reconciled }, "startup issue-graph liveness reconciliation created escalations");
-      }
-      
-      hen(async () => {
       const hangResult = await heartbeat.scanAdapterSilentHangs();
       if (hangResult.hangDetected > 0) {
         logger.warn({ ...hangResult }, "startup silent-hang watchdog cancelled hung adapter runs");
@@ -828,30 +822,6 @@ export async function startServer(): Promise<StartedServer> {
         logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
       }
 
-      const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-      if (reconciled.escalationsCreated > 0) {
-        logger.warn({ ...reconciled }, "startup issue-graph liveness reconciliation created escalations");
-      }
-      
-      hen(async () => {
-      const hangResult = await heartbeat.scanAdapterSilentHangs();
-      if (hangResult.hangDetected > 0) {
-        logger.warn({ ...hangResult }, "startup silent-hang watchdog cancelled hung adapter runs");
-      }
-      
-      hen(async () => {
-      const scanned = await heartbeat.scanSilentActiveRuns();
-      if (scanned.created > 0 || scanned.escalated > 0) {
-        logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
-      }
-      
-      hen(async () => {
-      const reviewed = await heartbeat.reconcileProductivityReviews();
-      if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
-        logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
-      }
-      
-      hen(async () => {
       const contextUsage = await heartbeat.scanAgentContextUsage();
       if (contextUsage.warningsCreated > 0 || contextUsage.preemptsCreated > 0) {
         logger.warn({ ...contextUsage }, "startup agent context monitor created review work");
