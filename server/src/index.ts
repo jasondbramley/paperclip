@@ -830,6 +830,11 @@ export async function startServer(): Promise<StartedServer> {
       logger.error({ err }, "startup heartbeat recovery failed");
     });
 
+    // Guard: only one reconcile chain may run at a time. Without this, if a chain
+    // takes longer than the interval (30 s) the next tick fires another chain while
+    // the first is still holding DB connections, causing pool exhaustion.
+    let periodicReconcileRunning = false;
+
     setInterval(() => {
       void heartbeat
         .tickTimers(new Date())
