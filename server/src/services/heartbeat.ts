@@ -12149,16 +12149,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // event stream on every 250ms tail chunk.
         const logActivityAt = new Date(ts);
         if (
-          isHeartbeatRunRuntimeStatusActive(run.status) &&
+          isHeartbeatRunRuntimeStatusActive(currentRun.status) &&
           logActivityAt.getTime() - lastLogRuntimeStatusTouchMs >=
             ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS
         ) {
           lastLogRuntimeStatusTouchMs = logActivityAt.getTime();
           const touchedStatus = touchHeartbeatRunRuntimeStatus({
-            companyId: run.companyId,
+            companyId: currentRun.companyId,
             issueId,
-            agentId: run.agentId,
-            runId: run.id,
+            agentId: currentRun.agentId,
+            runId: currentRun.id,
             at: logActivityAt,
           });
           if (touchedStatus) publishHeartbeatRunRuntimeProgress(touchedStatus);
