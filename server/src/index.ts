@@ -828,6 +828,7 @@ export async function startServer(): Promise<StartedServer> {
       const hangResult = await heartbeat.scanAdapterSilentHangs();
       if (hangResult.hangDetected > 0) {
         logger.warn({ ...hangResult }, "startup silent-hang watchdog cancelled hung adapter runs");
+      }
       const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
       if (taskWatchdogsReconciled.triggered > 0) {
         logger.warn(
@@ -934,6 +935,7 @@ export async function startServer(): Promise<StartedServer> {
           const hangResult = await heartbeat.scanAdapterSilentHangs();
           if (hangResult.hangDetected > 0) {
             logger.warn({ ...hangResult }, "periodic silent-hang watchdog cancelled hung adapter runs");
+          }
           const reconciled = await heartbeat.reconcileTaskWatchdogs();
           if (reconciled.triggered > 0) {
             logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");

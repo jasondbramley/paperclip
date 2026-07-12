@@ -9039,6 +9039,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       preemptsCreated,
       estimates,
     };
+  }
+
   async function reconcileTaskWatchdogs(opts?: { companyId?: string | null; runId?: string | null }) {
     return taskWatchdogs.reconcileTaskWatchdogs(opts);
   }
