@@ -10504,7 +10504,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           onLog,
           onMeta: onAdapterMeta,
           onRuntimeProgress: async (progress) => {
-            await recordCurrentHeartbeatRunRuntimeProgress(run, progress, issueId);
+            await recordCurrentHeartbeatRunRuntimeProgress(currentRun, progress, issueId);
           },
           onSpawn: async (meta) => {
             await persistRunProcessMetadata(currentRun.id, {
