@@ -259,7 +259,6 @@ describe("issue validators", () => {
     }).priority).toBe("critical");
   });
 
-  it("defaults issue work mode to standard and accepts planning", () => {
   it("defaults issue work mode to standard and accepts ask and planning", () => {
     expect(createIssueSchema.parse({ title: "Plan first" }).workMode).toBe("standard");
     expect(createIssueSchema.parse({ title: "Ask first", workMode: "ask" }).workMode).toBe("ask");
