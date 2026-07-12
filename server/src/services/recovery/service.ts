@@ -134,6 +134,7 @@ type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeed
 type StrandedRecoveryCause =
   | "stranded_assigned_issue"
   | "workspace_validation_failed"
+  | "configuration_incomplete"
   | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON;
 
 type SuccessfulRunHandoffRecoveryEvidence = {
@@ -207,6 +208,12 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "issue_dependencies_blocked",
 ]);
 
+// A continuation cancelled with this code is a *deliberate wait* (the latest run
+// reported it was parked for review/approval), not a lost execution path. When the
+// issue has a real waiting target we convert it into a normal dependency wait rather
+// than escalating it as stranded.
+const CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE = "issue_continuation_waiting_on_review";
+
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
@@ -218,7 +225,7 @@ type ContinuationRetryClassification = {
   errorCode: string | null;
 };
 
-function classifyContinuationFailure(latestRun: LatestIssueRun): ContinuationRetryClassification {
+export function classifyContinuationFailure(latestRun: LatestIssueRun): ContinuationRetryClassification {
   const errorCode = readNonEmptyString(latestRun?.errorCode);
   if (errorCode && NON_RETRYABLE_CONTINUATION_ERROR_CODES.has(errorCode)) {
     return { kind: "non_retryable", maxAttempts: 0, baseBackoffMs: 0, errorCode };
@@ -2642,6 +2649,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       ? "missing_disposition" as const
       : cause === "workspace_validation_failed"
         ? "workspace_validation" as const
+      : cause === "configuration_incomplete"
+        ? "configuration_validation" as const
       : "stranded_assigned_issue" as const;
   }
 
@@ -2717,11 +2726,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ? "Choose and record a valid issue disposition without copying transcript content."
         : recoveryCause === "workspace_validation_failed"
           ? "Repair the source issue workspace link, project workspace cwd, or git checkout before resuming adapter execution."
+        : recoveryCause === "configuration_incomplete"
+          ? "Bind the missing secret(s) named in the run failure to the agent/project/routine env before resuming adapter execution."
         : "Restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
-      wakePolicy: recoveryCause === "workspace_validation_failed"
+      wakePolicy: recoveryCause === "workspace_validation_failed" || recoveryCause === "configuration_incomplete"
         ? {
           type: "manual_repair_required",
-          reason: "workspace_validation_failed",
+          reason: recoveryCause,
           ownerAgentId,
         }
         : ownerAgentId
@@ -2749,6 +2760,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause: StrandedRecoveryCause;
   }) {
     if (input.recoveryCause === "workspace_validation_failed") return;
+    if (input.recoveryCause === "configuration_incomplete") return;
     if (!input.action.ownerAgentId) return;
     await deps.enqueueWakeup(input.action.ownerAgentId, {
       source: "assignment",
@@ -2864,9 +2876,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows.map((row) => row.blockerIssueId));
   }
 
-  async function existingUnresolvedBlockerIssueIds(companyId: string, issueId: string) {
+  async function existingUnresolvedBlockerIssues(companyId: string, issueId: string) {
     return db
-      .select({ blockerIssueId: issueRelations.issueId })
+      .select({ id: issueRelations.issueId, identifier: issues.identifier })
       .from(issueRelations)
       .innerJoin(
         issues,
@@ -2882,8 +2894,60 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           eq(issueRelations.type, "blocks"),
           notInArray(issues.status, ["done", "cancelled"]),
         ),
-      )
-      .then((rows) => rows.map((row) => row.blockerIssueId));
+      );
+  }
+
+  async function existingUnresolvedBlockerIssueIds(companyId: string, issueId: string) {
+    return existingUnresolvedBlockerIssues(companyId, issueId).then((rows) => rows.map((row) => row.id));
+  }
+
+  async function resolveContinuationWaitingOnReview(issue: typeof issues.$inferSelect) {
+    const existingBlockers = await existingUnresolvedBlockerIssues(issue.companyId, issue.id);
+    const openChildren = await db
+      .select({ id: issues.id, identifier: issues.identifier })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, issue.companyId),
+          eq(issues.parentId, issue.id),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      );
+    const blockedByIssueIds = [...new Set([...existingBlockers.map((row) => row.id), ...openChildren.map((row) => row.id)])];
+    if (blockedByIssueIds.length === 0) return null;
+
+    const updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
+    if (!updated) return null;
+
+    const waitingOn = formatIssueLinksForComment([...openChildren, ...existingBlockers]);
+    await issuesSvc.addComment(
+      issue.id,
+      `This task is waiting on ${waitingOn} to finish. ` +
+        "It will continue automatically when that work is done — there's nothing you need to do. " +
+        "(It was paused because the latest run reported it was waiting for review/approval; " +
+        "Paperclip turned that into a normal dependency wait instead of flagging it as stuck.)",
+      {},
+      { authorType: "system" },
+    );
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        identifier: issue.identifier,
+        status: "blocked",
+        previousStatus: issue.status,
+        source: "recovery.reconcile_continuation_waiting_on_review",
+        blockedByIssueIds,
+      },
+    });
+    return updated;
   }
 
   async function escalateStrandedAssignedIssue(input: {
@@ -2954,7 +3018,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     const shouldPostEscalationComment =
       recoveryAction.attemptCount === 1 ||
-      input.recoveryCause === "workspace_validation_failed";
+      input.recoveryCause === "workspace_validation_failed" ||
+      input.recoveryCause === "configuration_incomplete";
     if (shouldPostEscalationComment) {
       const escalationCommentMarker = `Recovery action: \`${recoveryAction.id}\``;
 
@@ -3008,6 +3073,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           ? "recovery.reconcile_successful_run_handoff_missing_state"
           : input.recoveryCause === "workspace_validation_failed"
             ? "recovery.reconcile_workspace_validation_failed"
+          : input.recoveryCause === "configuration_incomplete"
+            ? "recovery.reconcile_configuration_incomplete"
           : "recovery.reconcile_stranded_assigned_issue",
         recoveryCause: input.recoveryCause ?? "stranded_assigned_issue",
         latestRunId: input.latestRun?.id ?? null,
@@ -3064,9 +3131,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           inArray(issues.status, ["todo", "in_progress"]),
           sql`${issues.assigneeAgentId} is not null`,
         ),
-      )
-      .orderBy(asc(issues.updatedAt))
-      .limit(500);
+      );
 
     const result = {
       assignmentDispatched: 0,
@@ -3077,6 +3142,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       orphanBlockersAssigned: 0,
       successfulRunHandoffEscalated: 0,
       escalated: 0,
+      waitingOnReviewResolved: 0,
       recentProgressExempted: 0,
       skipped: 0,
       issueIds: [] as string[],
@@ -3199,19 +3265,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.skipped += 1;
         continue;
       }
-
-      if (isPinnedLiveChatAnchorIssue(issue)) {
-        if (latestRun?.status === "succeeded") {
-          result.successfulContinuationObserved += 1;
-          result.skipped += 1;
-          continue;
-        }
-        if (latestRun && await hasIssueCommentAfterRun(issue.id, latestRun)) {
-          result.skipped += 1;
-          continue;
-        }
-      }
-
       const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
       if (handoffEvidence) {
         if (!handoffEvidence.exhausted) {
@@ -3295,238 +3348,77 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
         continue;
       }
-      const failureReason = readNonEmptyString(latestRun?.error ?? null);
-      const retryCount = readRecoveryRetryCount(latestRun?.contextSnapshot);
-      const isStreamDisconnect = matchesStreamDisconnectFailure(failureReason);
-      const isContextOverflow = matchesContextOverflowFailure(failureReason);
+      if (isUnsuccessfulTerminalIssueRun(latestRun)) {
+        const classification = classifyContinuationFailure(latestRun);
 
-      if (isStreamDisconnect) {
-        // Track cross-heartbeat stream-disconnect failures in runtime state.
-        const runtimeStateRow = await db
-          .select()
-          .from(agentRuntimeState)
-          .where(eq(agentRuntimeState.agentId, agentId))
-          .then((rows) => rows[0] ?? null);
-        const now = new Date();
-        const currentSdState = readStreamDisconnectState(runtimeStateRow?.stateJson);
-        const { nextState: nextSdState, attemptsInWindow } = nextStreamDisconnectState(currentSdState, now);
-        const rootState = parseObject(runtimeStateRow?.stateJson);
-        const autoRecovery = parseObject(rootState.autoRecovery);
-        await db
-          .insert(agentRuntimeState)
-          .values({
-            agentId,
-            companyId: issue.companyId,
-            adapterType: agent.adapterType,
-            stateJson: {
-              ...rootState,
-              autoRecovery: { ...autoRecovery, streamDisconnect: nextSdState },
-            },
-            updatedAt: now,
-          })
-          .onConflictDoUpdate({
-            target: agentRuntimeState.agentId,
-            set: {
-              stateJson: {
-                ...rootState,
-                autoRecovery: { ...autoRecovery, streamDisconnect: nextSdState },
-              },
-              updatedAt: now,
-            },
+        if (classification.errorCode === CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE) {
+          const resolved = await resolveContinuationWaitingOnReview(issue);
+          if (resolved) {
+            result.waitingOnReviewResolved += 1;
+            result.issueIds.push(issue.id);
+            continue;
+          }
+        }
+
+        if (classification.kind === "non_retryable") {
+          const failureSummary = summarizeRunFailureForIssueComment(latestRun);
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun,
+            comment:
+              "Paperclip detected a non-retryable failure on this issue's continuation run " +
+              `(\`${classification.errorCode}\`). Skipping automatic retries and moving it to \`blocked\` ` +
+              `so it is visible for intervention.${failureSummary ?? ""}`,
           });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
 
-        // Cross-heartbeat escalation: persistent network instability detected.
-        if (attemptsInWindow >= STREAM_DISCONNECT_CROSS_HEARTBEAT_ESCALATION_LIMIT) {
-          await issuesSvc.addComment(
+        if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
+          const { consecutive, latestFinishedAt } = await summarizeRecentContinuationRetries(
+            issue.companyId,
             issue.id,
-            `Blocker: Jason Bramley — Persistent stream-disconnect failures: ${attemptsInWindow} failed attempts in the last 30 minutes across multiple heartbeat cycles. Network instability suspected. Manual review required before further retries.`,
-            { agentId },
-            { authorType: "agent" },
+            classification.errorCode,
           );
-          await issuesSvc.update(issue.id, { status: "blocked" });
-          result.escalated += 1;
-          result.issueIds.push(issue.id);
-          continue;
-        }
-
-        if (retryCount < STREAM_DISCONNECT_RETRY_LIMIT) {
-          if (await isInvocationBudgetBlocked(issue, agentId)) {
-            result.skipped += 1;
-            continue;
-          }
-
-          // Create a delayed scheduled_retry run (10-15s jitter) so the network can stabilise.
-          const delayMs = STREAM_DISCONNECT_RETRY_DELAY_MS_MIN +
-            Math.floor(Math.random() * (STREAM_DISCONNECT_RETRY_DELAY_MS_MAX - STREAM_DISCONNECT_RETRY_DELAY_MS_MIN));
-          const scheduledRetryAt = new Date(now.getTime() + delayMs);
-
-          const wakeupRequest = await db
-            .insert(agentWakeupRequests)
-            .values({
-              companyId: issue.companyId,
-              agentId,
-              source: "automation",
-              triggerDetail: "system",
-              reason: "issue_continuation_needed",
-              payload: withRecoveryModelProfileHint({
-                issueId: issue.id,
-                ...(latestRun?.id ? { retryOfRunId: latestRun.id } : {}),
-              }, "normal_model"),
-              status: "queued",
-              requestedByActorType: "system",
-              requestedByActorId: null,
-              updatedAt: now,
-            })
-            .returning()
-            .then((rows) => rows[0] ?? null);
-
-          const scheduledRun = wakeupRequest
-            ? await db
-              .insert(heartbeatRuns)
-              .values({
-                companyId: issue.companyId,
-                agentId,
-                invocationSource: "automation",
-                triggerDetail: "system",
-                status: "scheduled_retry",
-                scheduledRetryAt,
-                scheduledRetryAttempt: 1,
-                scheduledRetryReason: "stream_disconnect_retry",
-                wakeupRequestId: wakeupRequest.id,
-                contextSnapshot: withRecoveryModelProfileHint({
-                  issueId: issue.id,
-                  taskId: issue.id,
-                  wakeReason: "issue_continuation_needed",
-                  retryReason: "issue_continuation_needed",
-                  source: "issue.continuation_recovery",
-                  ...(latestRun?.id ? { retryOfRunId: latestRun.id } : {}),
-                  retry_count: retryCount + 1,
-                  stream_disconnect_resume_notice:
-                    "If you are resuming after a stream-disconnect retry, do a quick state check before starting new tool work — your last attempt may have left partial side effects.",
-                }, "normal_model"),
-                retryOfRunId: latestRun?.id ?? null,
-                updatedAt: now,
-              })
-              .returning()
-              .then((rows) => rows[0] ?? null)
-            : null;
-
-          if (wakeupRequest && scheduledRun) {
-            await db
-              .update(agentWakeupRequests)
-              .set({ runId: scheduledRun.id, updatedAt: now })
-              .where(eq(agentWakeupRequests.id, wakeupRequest.id));
-            await db
-              .update(issues)
-              .set({ executionRunId: scheduledRun.id, updatedAt: now })
-              .where(eq(issues.id, issue.id));
-            result.continuationRequeued += 1;
-            result.issueIds.push(issue.id);
-          } else {
-            result.skipped += 1;
-          }
-          continue;
-        }
-
-        // Retry limit exhausted — untagged comment so this network event does not mirror to staff Teams.
-        await issuesSvc.addComment(
-          issue.id,
-          `Stream-disconnect retry limit reached after ${STREAM_DISCONNECT_RETRY_LIMIT} attempts. Network event: ${failureReason ?? "stream disconnect"}. Moving issue to blocked pending manual review.`,
-          { agentId },
-          { authorType: "agent" },
-        );
-        await issuesSvc.update(issue.id, { status: "blocked" });
-        result.escalated += 1;
-        result.issueIds.push(issue.id);
-        continue;
-      }
-
-      if (isContextOverflow) {
-        const runtimeStateRow = await db
-          .select()
-          .from(agentRuntimeState)
-          .where(eq(agentRuntimeState.agentId, agentId))
-          .then((rows) => rows[0] ?? null);
-        const now = new Date();
-        const currentResetState = readAutoResetState(runtimeStateRow?.stateJson);
-        const { nextState, attemptsInWindow } = nextAutoResetState(currentResetState, now);
-
-        if (attemptsInWindow <= AUTO_RESET_LIMIT_PER_HOUR) {
-          const rootState = parseObject(runtimeStateRow?.stateJson);
-          const autoRecovery = parseObject(rootState.autoRecovery);
-          await db
-            .insert(agentRuntimeState)
-            .values({
-              agentId,
-              companyId: issue.companyId,
-              adapterType: (await getAgent(agentId))?.adapterType ?? "codex_local",
-              sessionId: null,
-              lastError: null,
-              stateJson: {
-                ...rootState,
-                autoRecovery: { ...autoRecovery, contextOverflow: nextState },
-              },
-              updatedAt: now,
-            })
-            .onConflictDoUpdate({
-              target: agentRuntimeState.agentId,
-              set: {
-                sessionId: null,
-                lastError: null,
-                stateJson: {
-                  ...rootState,
-                  autoRecovery: { ...autoRecovery, contextOverflow: nextState },
-                },
-                updatedAt: now,
-              },
+          if (consecutive >= classification.maxAttempts) {
+            const failureSummary = summarizeRunFailureForIssueComment(latestRun);
+            const attemptCopy = consecutive <= 1 ? "" : ` (${consecutive}× attempts)`;
+            const causeCopy = classification.errorCode
+              ? ` Latest cause: \`${classification.errorCode}\`.`
+              : "";
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: "in_progress",
+              latestRun,
+              comment:
+                "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
+                `execution disappeared, but it still has no live execution path${attemptCopy}.${causeCopy}${failureSummary ?? ""} ` +
+                "Moving it to `blocked` so it is visible for intervention.",
             });
-
-          const resetCommentTs = now.toISOString();
-          if (await isInvocationBudgetBlocked(issue, agentId)) {
-            result.skipped += 1;
+            if (updated) {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
             continue;
           }
-          const queued = await enqueueStrandedIssueRecovery({
-            issueId: issue.id,
-            agentId,
-            reason: "issue_continuation_needed",
-            retryReason: "issue_continuation_needed",
-            source: "issue.continuation_recovery",
-            retryOfRunId: latestRun?.id ?? null,
-            extraContext: { retry_count: 0, auto_reset_after_context_overflow: true },
-          });
-          if (queued) {
-            await issuesSvc.addComment(
-              issue.id,
-              `Auto-reset session after context overflow at ${resetCommentTs}. Retry in progress.`,
-              { agentId, runId: queued.id },
-              { authorType: "agent" },
-            );
-            result.continuationRequeued += 1;
-            result.issueIds.push(issue.id);
-          } else {
-            result.skipped += 1;
-          }
-          continue;
-        }
-      }
 
-      if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
-        const failureSummary = summarizeRunFailureForIssueComment(latestRun);
-        const updated = await escalateStrandedAssignedIssue({
-          issue,
-          previousStatus: "in_progress",
-          latestRun,
-          comment:
-            "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
-            `execution disappeared, but it still has no live execution path.${failureSummary ?? ""} ` +
-            "Moving it to `blocked` so it is visible for intervention.",
-        });
-        if (updated) {
-          result.escalated += 1;
-          result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
+          if (classification.baseBackoffMs > 0 && latestFinishedAt) {
+            const elapsed = Date.now() - latestFinishedAt.getTime();
+            const requiredDelay = classification.baseBackoffMs *
+              Math.pow(2, Math.max(0, consecutive - 1));
+            if (elapsed < requiredDelay) {
+              result.skipped += 1;
+              continue;
+            }
+          }
         }
       }
 
