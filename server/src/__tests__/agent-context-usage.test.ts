@@ -196,6 +196,47 @@ describeEmbeddedPostgres("agent context preempt retire/rebuild", () => {
     expect(preemptIssues[0]?.status).toBe("todo");
   });
 
+  it("deduplicates repeated preempt scans for the same agent", async () => {
+    const seeded = await seedPreemptCandidate();
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.scanAgentContextUsage({
+      companyId: seeded.companyId,
+      now: new Date("2026-05-25T12:00:00Z"),
+    });
+    const second = await heartbeat.scanAgentContextUsage({
+      companyId: seeded.companyId,
+      now: new Date("2026-05-25T12:05:00Z"),
+    });
+
+    const preemptIssues = await db.select().from(issues).where(eq(issues.originKind, "agent_context_usage_preempt"));
+    expect(first.preemptsCreated).toBe(1);
+    expect(second.preemptsCreated).toBe(0);
+    expect(preemptIssues).toHaveLength(1);
+  });
+
+  it("ignores explicitly retired agents even when stale heartbeat defaults remain enabled", async () => {
+    const seeded = await seedPreemptCandidate();
+    await db
+      .update(agents)
+      .set({
+        status: "idle",
+        metadata: { retired: true, retiredAt: "2026-06-20T00:00:00.000Z" },
+      })
+      .where(eq(agents.id, seeded.agentId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanAgentContextUsage({
+      companyId: seeded.companyId,
+      now: new Date("2026-05-25T12:00:00Z"),
+    });
+
+    const preemptIssues = await db.select().from(issues).where(eq(issues.originKind, "agent_context_usage_preempt"));
+    expect(result.estimates.map((estimate) => estimate.agentId)).not.toContain(seeded.agentId);
+    expect(result.preemptsCreated).toBe(0);
+    expect(preemptIssues).toHaveLength(0);
+  });
+
   it("ignores retired paused merged agents with heartbeat disabled", async () => {
     const seeded = await seedPreemptCandidate();
     const retiredAgentId = randomUUID();
