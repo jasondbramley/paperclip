@@ -2111,17 +2111,21 @@ function isAgentContextMonitorEligible(
   const metadata = parseObject(agent.metadata);
   const runtime = parseObject(agent.runtimeConfig);
   const heartbeat = parseObject(runtime.heartbeat);
-  const wakeOnDemand = heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation;
   const retiredOrMerged =
+    metadata.retired === true ||
     Boolean(readNonEmptyString(metadata.retiredAt)) ||
     Boolean(readNonEmptyString(metadata.retiredBy)) ||
     Boolean(readNonEmptyString(metadata.replacementAgentId)) ||
     Boolean(readNonEmptyString(metadata.mergedIntoAgentId)) ||
-    Boolean(readNonEmptyString(metadata.mergedInto)) ||
-    Boolean(readNonEmptyString(metadata.rebuiltFromAgentId));
+    Boolean(readNonEmptyString(metadata.mergedInto));
 
+  // Retirement metadata is authoritative. Retired agents may retain a stale or
+  // incomplete heartbeat policy after a merge, but they no longer own an
+  // execution queue and must never generate context warning/preempt work.
+  if (retiredOrMerged) return false;
+
+  const wakeOnDemand = heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation;
   return !(
-    retiredOrMerged &&
     asBoolean(heartbeat.enabled, true) === false &&
     asBoolean(wakeOnDemand, true) === false
   );
