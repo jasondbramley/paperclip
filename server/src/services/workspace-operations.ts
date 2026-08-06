@@ -10,6 +10,36 @@ import { getWorkspaceOperationLogStore } from "./workspace-operation-log-store.j
 
 type WorkspaceOperationRow = typeof workspaceOperations.$inferSelect;
 
+const MAX_DEADLOCK_RETRIES = 5;
+const DEADLOCK_RETRY_DELAY_MS = 25;
+
+export function isPostgresDeadlockError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 6; depth += 1) {
+    if (!current || typeof current !== "object") return false;
+    const record = current as { code?: unknown; cause?: unknown };
+    if (record.code === "40P01") return true;
+    current = record.cause;
+  }
+  return false;
+}
+
+function sleep(milliseconds: number) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+export async function withDeadlockRetry<T>(operation: () => Promise<T>, attempt = 0): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (!isPostgresDeadlockError(error) || attempt + 1 >= MAX_DEADLOCK_RETRIES) {
+      throw error;
+    }
+    await sleep(DEADLOCK_RETRY_DELAY_MS * 2 ** attempt);
+    return withDeadlockRetry(operation, attempt + 1);
+  }
+}
+
 function toWorkspaceOperation(row: WorkspaceOperationRow): WorkspaceOperation {
   return {
     id: row.id,
@@ -99,13 +129,15 @@ export function workspaceOperationService(db: Db) {
         async attachExecutionWorkspaceId(nextExecutionWorkspaceId) {
           executionWorkspaceId = nextExecutionWorkspaceId ?? null;
           if (!executionWorkspaceId || createdIds.length === 0) return;
-          await db
-            .update(workspaceOperations)
-            .set({
-              executionWorkspaceId,
-              updatedAt: new Date(),
-            })
-            .where(inArray(workspaceOperations.id, createdIds));
+          await withDeadlockRetry(() =>
+            db
+              .update(workspaceOperations)
+              .set({
+                executionWorkspaceId,
+                updatedAt: new Date(),
+              })
+              .where(inArray(workspaceOperations.id, createdIds)),
+          );
         },
 
         async recordOperation(recordInput) {
@@ -133,24 +165,26 @@ export function workspaceOperationService(db: Db) {
             });
           };
 
-          await db.insert(workspaceOperations).values({
-            id,
-            companyId: input.companyId,
-            executionWorkspaceId,
-            heartbeatRunId: input.heartbeatRunId ?? null,
-            issueId: input.issueId ?? null,
-            phase: recordInput.phase,
-            command: recordInput.command ?? null,
-            cwd: recordInput.cwd ?? null,
-            status: "running",
-            logStore: handle.store,
-            logRef: handle.logRef,
-            metadata: redactCurrentUserValue(
-              recordInput.metadata ?? null,
-              currentUserRedactionOptions,
-            ) as Record<string, unknown> | null,
-            startedAt,
-          });
+          await withDeadlockRetry(() =>
+            db.insert(workspaceOperations).values({
+              id,
+              companyId: input.companyId,
+              executionWorkspaceId,
+              heartbeatRunId: input.heartbeatRunId ?? null,
+              issueId: input.issueId ?? null,
+              phase: recordInput.phase,
+              command: recordInput.command ?? null,
+              cwd: recordInput.cwd ?? null,
+              status: "running",
+              logStore: handle.store,
+              logRef: handle.logRef,
+              metadata: redactCurrentUserValue(
+                recordInput.metadata ?? null,
+                currentUserRedactionOptions,
+              ) as Record<string, unknown> | null,
+              startedAt,
+            }),
+          );
           createdIds.push(id);
 
           try {
@@ -160,47 +194,51 @@ export function workspaceOperationService(db: Db) {
             await append("stderr", result.stderr ?? null);
             const finalized = await logStore.finalize(handle);
             const finishedAt = new Date();
-            const row = await db
-              .update(workspaceOperations)
-              .set({
-                executionWorkspaceId,
-                status: result.status ?? "succeeded",
-                exitCode: result.exitCode ?? null,
-                stdoutExcerpt: stdoutExcerpt || null,
-                stderrExcerpt: stderrExcerpt || null,
-                logBytes: finalized.bytes,
-                logSha256: finalized.sha256,
-                logCompressed: finalized.compressed,
-                metadata: redactCurrentUserValue(
-                  combineMetadata(recordInput.metadata, result.metadata),
-                  currentUserRedactionOptions,
-                ) as Record<string, unknown> | null,
-                finishedAt,
-                updatedAt: finishedAt,
-              })
-              .where(eq(workspaceOperations.id, id))
-              .returning()
-              .then((rows) => rows[0] ?? null);
+            const row = await withDeadlockRetry(() =>
+              db
+                .update(workspaceOperations)
+                .set({
+                  executionWorkspaceId,
+                  status: result.status ?? "succeeded",
+                  exitCode: result.exitCode ?? null,
+                  stdoutExcerpt: stdoutExcerpt || null,
+                  stderrExcerpt: stderrExcerpt || null,
+                  logBytes: finalized.bytes,
+                  logSha256: finalized.sha256,
+                  logCompressed: finalized.compressed,
+                  metadata: redactCurrentUserValue(
+                    combineMetadata(recordInput.metadata, result.metadata),
+                    currentUserRedactionOptions,
+                  ) as Record<string, unknown> | null,
+                  finishedAt,
+                  updatedAt: finishedAt,
+                })
+                .where(eq(workspaceOperations.id, id))
+                .returning()
+                .then((rows) => rows[0] ?? null),
+            );
             if (!row) throw notFound("Workspace operation not found");
             return toWorkspaceOperation(row);
           } catch (error) {
             await append("stderr", error instanceof Error ? error.message : String(error));
             const finalized = await logStore.finalize(handle).catch(() => null);
             const finishedAt = new Date();
-            await db
-              .update(workspaceOperations)
-              .set({
-                executionWorkspaceId,
-                status: "failed",
-                stdoutExcerpt: stdoutExcerpt || null,
-                stderrExcerpt: stderrExcerpt || null,
-                logBytes: finalized?.bytes ?? null,
-                logSha256: finalized?.sha256 ?? null,
-                logCompressed: finalized?.compressed ?? false,
-                finishedAt,
-                updatedAt: finishedAt,
-              })
-              .where(eq(workspaceOperations.id, id));
+            await withDeadlockRetry(() =>
+              db
+                .update(workspaceOperations)
+                .set({
+                  executionWorkspaceId,
+                  status: "failed",
+                  stdoutExcerpt: stdoutExcerpt || null,
+                  stderrExcerpt: stderrExcerpt || null,
+                  logBytes: finalized?.bytes ?? null,
+                  logSha256: finalized?.sha256 ?? null,
+                  logCompressed: finalized?.compressed ?? false,
+                  finishedAt,
+                  updatedAt: finishedAt,
+                })
+                .where(eq(workspaceOperations.id, id)),
+            );
             throw error;
           }
         },
