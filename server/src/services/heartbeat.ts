@@ -2470,9 +2470,12 @@ function redactHeartbeatRunForResponse<T extends {
   if (!run) return null;
   const resultJson = redactHeartbeatRunResultJsonForResponse(run.resultJson);
   if (!isHeartbeatRunSecurityRedacted({ resultJson })) {
+    // FORK-NOTE (ITO-2805, hop 8a): a run that is not security-redacted keeps its full resultJson so that
+    // upstream's structured metadata (errorFamily, providerQuotaRetryNotBefore, workspaceValidation,
+    // provenance) reaches callers. Only the raw stdout/stderr excerpts are stripped here.
     return {
       ...run,
-      resultJson,
+      resultJson: run.resultJson ?? null,
       stdoutExcerpt: null,
       stderrExcerpt: null,
     };
