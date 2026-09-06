@@ -83,6 +83,7 @@ import {
   buildHeartbeatRunIssueComment,
   HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS,
   mergeHeartbeatRunResultJson,
+  HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
 } from "./heartbeat-run-summary.js";
 import {
   buildHeartbeatRunStopMetadata,
@@ -1746,6 +1747,14 @@ const heartbeatRunListResultColumns = {
 const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
   case
     when ${heartbeatRuns.resultJson} is null then null
+    -- FORK-NOTE (ITO-2805, hop 8a): small results pass through minus raw stdout/stderr so upstream's structured
+    -- metadata (errorFamily, providerQuotaRetryNotBefore, workspaceValidation, provenance) reaches callers;
+    -- oversized results still collapse to the summary object below.
+    when pg_column_size(${heartbeatRuns.resultJson}) <= ${HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES}
+      then (${heartbeatRuns.resultJson} - 'stdout' - 'stderr') || jsonb_strip_nulls(jsonb_build_object(
+        'stdoutTruncated', case when ${heartbeatRuns.resultJson} ? 'stdout' then to_jsonb(true) else null end,
+        'stderrTruncated', case when ${heartbeatRuns.resultJson} ? 'stderr' then to_jsonb(true) else null end
+      ))
     else jsonb_strip_nulls(
       jsonb_build_object(
         'securityRedacted', coalesce(
