@@ -72,6 +72,7 @@ import {
   // Sidebar
   upsertSidebarOrderPreferenceSchema,
   // Execution workspaces
+  reconcileExecutionWorkspaceBranchSchema,
   updateExecutionWorkspaceSchema,
   workspaceOverviewQuerySchema,
   workspaceRuntimeControlTargetSchema,
@@ -661,6 +662,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/members/{memberId}/archive",
   "PATCH /api/companies/{companyId}/members/{memberId}/permissions",
   "GET /api/companies/{companyId}/user-directory",
+  "POST /api/execution-workspaces/{id}/reconcile-branch",
   "GET /api/board-api-keys",
   "POST /api/board-api-keys",
   "DELETE /api/board-api-keys/{keyId}",
@@ -3626,6 +3628,18 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/execution-workspaces/{id}/reconcile-branch",
+  tags: ["execution-workspaces"],
+  summary: "Reconcile an execution workspace branch record",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(reconcileExecutionWorkspaceBranchSchema),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/execution-workspaces/{id}/runtime-services/{action}",
   tags: ["execution-workspaces"],
   summary: "Control a runtime service in a workspace",
@@ -4848,6 +4862,7 @@ for (const route of [
   ["get", "/api/companies/{companyId}/skills/{skillId}/versions/{versionId}", "Get a skill version"],
   ["post", "/api/companies/{companyId}/skills/{skillId}/star", "Star a company skill"],
   ["delete", "/api/companies/{companyId}/skills/{skillId}/star", "Unstar a company skill"],
+  ["get", "/api/companies/{companyId}/skills/{skillId}/fork-precheck", "Preview company skill fork impact"],
   ["post", "/api/companies/{companyId}/skills/{skillId}/fork", "Fork a company skill"],
   ["get", "/api/companies/{companyId}/skills/{skillId}/comments", "List skill comments"],
   ["post", "/api/companies/{companyId}/skills/{skillId}/comments", "Create a skill comment"],
