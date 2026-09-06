@@ -11743,7 +11743,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 name: agent.name,
                 companyId: agent.companyId,
               },
-              heartbeatRunId: run.id,
+              heartbeatRunId: run?.id ?? null,
               enableWorkspaceBranchReconcileForward:
                 resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,
               recorder: workspaceOperationRecorder,
@@ -11759,7 +11759,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             name: agent.name,
             companyId: agent.companyId,
           },
-          heartbeatRunId: run.id,
+          heartbeatRunId: run?.id ?? null,
           enableWorkspaceBranchReconcileForward:
             resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,
           recorder: workspaceOperationRecorder,
@@ -12573,7 +12573,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     }
                     : null,
                   executionWorkspaceId: branchInspection.workspaceRecord.id,
-                  heartbeatRunId: run.id,
+                  heartbeatRunId: run?.id ?? null,
                   enableWorkspaceBranchReconcileForward:
                     resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,
                   persistForwardReconcile: false,
@@ -13327,7 +13327,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 logger.warn(
                   {
                     err: scratchCleanupEventError,
-                    runId: run.id,
+                    runId: run?.id ?? null,
                     scratchDir: scratchForCleanup.dir,
                   },
                   "failed to record heartbeat run scratch cleanup event",
